@@ -10,7 +10,7 @@ Status: 分析记录
 
 ---
 
-# 第一部分 — 第一性原理:Cordis 要解决什么问题
+# 第零部分 — 第一性原理:Cordis 要解决什么问题
 
 ## 组合问题
 
@@ -33,6 +33,242 @@ Cordis 围绕一个问题展开:**如何让独立的、可复用的能力单元(
 > 把"plugin 的存在"和"plugin 的清理"做成同一个可组合对象(`Disposable`);把它挂在一个生命周期节点(`Fiber`)上;让可见性走**原型链**加一个 **Symbol** 键控的**隔离映射**;让**协调**走一个**五模态事件分发器**。
 
 换句话说:**Cordis 用一对原语(Disposable + 原型链)同时表达依赖、生命周期和隔离**,避免"DI 框架"与"生命周期框架"的概念分裂。
+
+---
+
+# 第一部分 — 基础概念:定义 + 设计初衷 + 比喻
+
+本部分是 Cordis 的**最小词汇表**。后文所有分析、特性拆解都建立在这套词汇上。
+每条概念用三段介绍:**定义** 讲它是什么,**设计初衷** 讲为什么需要,
+**比喻** 用一个共享办公楼场景做具象化(可跳过,不影响机制理解)。
+
+## 一、10 个基础概念
+
+### 1. Context
+
+**定义**:原型链作用域 + 内置服务的根容器。
+
+**设计初衷**:让 scope 复用 JS 原生查找语义,不引入新的 DI token 词汇。
+子 context 自动继承父的所有属性,prototype chain 即 scope。
+
+**比喻**:一栋共享办公楼。楼栋本身是根 context;5 楼想要打印机时,
+电梯(原型链)自动先上 6 楼、再上顶楼——不写专门代码。
+
+### 2. Fiber
+
+**定义**:plugin 的运行时实例 + 副作用集合 + 生命周期状态机。
+
+**设计初衷**:一个 plugin 可被加载多次,每次加载需要独立的生命周期和副作用隔离。
+把"运行时实例"和"它产生的所有副作用"绑在一起,就能一次 unload 一并清理。
+
+**比喻**:一层楼就是一个 fiber。Alice 在 6 楼注册的所有 listener、interval、
+event handler 都挂在这层楼上,搬走时一并带走。
+
+### 3. Plugin
+
+**定义**:可被加载的能力单元,三种形状(函数 / 类 / 对象)。
+
+**设计初衷**:三种形状对应不同写作风格——函数最小、类适合 OO 继承、对象适合带元数据。
+框架归一化这三种形状,统一加载和元数据协议。
+
+**比喻**:一份"入住申请表"。函数是手写一段话、类是填表、对象是带附件的完整材料。
+物业不管形状,只看 inject 声明和 Config schema。
+
+### 4. Service
+
+**定义**:注册到 ctx 上的命名能力,持有者提供具体实现。
+
+**设计初衷**:把"这个类实例代表一个能力"和"它对 ctx 可见"绑成一个动作。
+构造时自动 provide,消除"忘了 register 就用不上"的失误。
+
+**比喻**:一项楼内服务(前台、会议室)。服务提供者自己报名,
+其他楼层 inject 它就能调用——不需要主动打招呼。
+
+### 5. Event(事件)
+
+**定义**:带类型签名的命名协调通道,有 5 种分发模态。
+
+**设计初衷**:plugin 之间的协调至少是五种关系——通知、集合、抢答、投票、中间件链。
+如果只有 `emit`,所有模式都被迫塞进一个 fire-and-forget 接口再手动加状态。
+Cordis 给五种语义独立命名,强迫调用者选对。
+
+**比喻**:楼栋的 PA 系统。"下班了" 是 `emit`,"5 点全员开会" 是 `parallel`,
+"第一个同意的举手" 是 `serial`,"有人反对吗" 是 `bail`,
+"3 号线 Bob 决定放行" 是 `waterfall`——五种开会议事的方式。
+
+### 6. Effect / Disposable
+
+**定义**:可被注册、撤销的副作用单元。
+每个注册 API(`plugin` / `on` / `provide` / `effect` / `accessor` / `mixin`)都是 effect,都返回 disposer。
+
+**设计初衷**:传统 framework 要求作者维护 listener 列表、写清理钩子、处理级联卸载,
+漏一处就泄漏。Cordis 统一承诺:**只管注册,不管清理**——
+作者写 `() => { /* 副作用 */ }`,framework 决定何时撤销。
+
+**比喻**:钥匙扣。Alice 登记一项副作用,物业给她一把钥匙,钥匙上挂着
+"这层楼拆除时先做 X"。搬走时物业按反向顺序用完所有钥匙,
+Alice 从不写清理代码。
+
+### 7. Isolation / Intercept / Mixin(三个作用域操作符)
+
+**定义**:
+- `isolate(name, label?)` — 给同名 service 创建独立 Symbol key
+- `intercept(name, config)` — 在配置合并链上插入一项
+- `mixin(source, mixins)` — 把 service 方法以 accessor 形式暴露到 ctx 上
+
+**设计初衷**:同名多实例、配置级联、服务方法伪装 ctx 方法——三者都是
+"在原型链上做不同映射"。Cordis 用同一套底层机制覆盖三种需要。
+
+**比喻**:
+- isolate = 6 楼和 7 楼各有"会议室 A"(同名不同房间)
+- intercept = CEO 公告:"所有会议室必须有投影仪"(自顶向下级联)
+- mixin = 每层楼都能 `ctx.print(...)` 调前台打印机(service 方法伪装)
+
+### 8. Reflect / Proxy(反射层)
+
+**定义**:让 `ctx.foo` 自动解析 service 的 Proxy 机制。
+
+**设计初衷**:经典 DI 要求 `ctx.inject('foo').getService('foo').method()`——啰嗦。
+Proxy 让 `ctx.foo` 触发 DI,API 简洁;同时,服务方法被调时 `this` 自动跟调用者 ctx。
+
+**比喻**:电梯的自动导航——你说"我要打印机",电梯根据当前位置自动找到最近的,
+不需要你记"打印机的服务名是什么"。
+
+### 9. Epoch(epoch 字符串)
+
+**定义**:fiber 当前依赖集合的指纹字符串。
+
+**设计初衷**:plugin 的依赖图是动态的——服务被卸载 / 重载 / 替换。
+手动级联通知脆弱。Epoch 用一个字符串给依赖集合"指纹":
+变了说明依赖变了,触发 reload。
+
+**比喻**:每位住户的"供应商清单编号"。物业看编号:变了 = 换了供应商,
+需要重新签合同;没变 = 还是原班人马,啥都不动。
+
+### 10. Symbol(共享符号表)
+
+**定义**:Cordis 用一组固定的 unique symbols 做协议标记。
+
+**设计初衷**:框架内部协议标记(`isolate` / `intercept` / `shadow` 等)
+不能撞用户起的属性名。用 Symbol 作 key,跨 realm 共享,字符串属性名互不干扰。
+
+**比喻**:楼栋内部的"内部代号"——住户看不见的门牌号。物业靠代号管门,
+外人靠名字找房,两套编号互不冲突。
+
+## 二、模块骨架(7 个 src 文件)
+
+`vendor/cordis/src/index.ts` 桶导出,真正的逻辑在 7 个文件里。
+
+| 模块 | 一句话职责 |
+|---|---|
+| `context.ts` | Context 类 + 三个作用域操作符 |
+| `service.ts` | Service 基类 + intercept 配置合并 |
+| `fiber.ts` | 生命周期 + effect + epoch 反应性 |
+| `events.ts` | 5 模态事件分发 |
+| `registry.ts` | Plugin 形状归一化 + 启动 |
+| `reflect.ts` | Proxy handler + service store |
+| `utils.ts` | DisposableList + getTraceable + symbols |
+
+模块依赖:
+
+```
+       ┌──────────────┐
+       │   context.ts │  ← 根
+       └──────┬───────┘
+              │
+       ┌──────▼───────┐
+       │   fiber.ts   │  ← 生命周期、effect、epoch
+       └──────┬───────┘
+              │
+   ┌──────────┼──────────┬────────────┐
+   ▼          ▼          ▼            ▼
+events.ts  registry.ts  reflect.ts  service.ts
+   │          │          │
+   └──────────┴──────────┴────→ utils.ts (叶子,只依赖 cosmokit)
+```
+
+## 三、5 个一等公民
+
+10 个概念中,**5 个承担 Cordis 的核心机制**:
+
+| 一等公民 | 核心作用 |
+|---|---|
+| Effect / Disposable | plugin 作者只写 register,framework 负责 cleanup |
+| 原型链 Context | scope 复用 JS 原生查找语义 |
+| Symbol 隔离 | 同名服务多实例 |
+| 5 模态事件 | 协调语义独立命名 |
+| Epoch 反应性 | 依赖变化自动 reload |
+
+剩下 5 个概念(Service / Plugin / Proxy / State machine / Reflect symbols)是工程化封装。
+
+## 四、把它们串起来看:完整生命周期
+
+> Alice(LLM provider)在 6 楼的小组被合并到 8 楼。
+
+**阶段 1 — 搬入**
+Alice 调用 `ctx.plugin(MyLLMPlugin, { model: 'v4' })`。物业给她一间房(Fiber),
+钥匙环空着但已挂这层楼。状态:`PENDING`(等待依赖)。
+
+**阶段 2 — 依赖到位**
+Bob 在 5 楼声明 `inject = ['llm']`。Bob 开张,物业检查:Alice 的钥匙环需要 `llm`。
+Bob 跑完,Alice 收到 `llm`。状态:`PENDING → LOADING → ACTIVE`。
+epoch 变化:`'__INACTIVE__' → ':1'`(Bob 的 uid)。
+
+**阶段 3 — 日常广播**
+`ctx.events.emit('model-request', ...)`。PA 广播,所有订阅者并行触发。
+Alice 的 listener 本身是注册过的 effect;这层楼拆除时,她的 listener 自动消失。
+
+**阶段 4 — 换供应商**
+物业通知:"LLM 供应商从 DeepSeek 换成 Pi-AI"。6 楼的 `llm` inject 被替换。
+Bob 的 epoch 变化:`':1' → ':2'`。Bob `_unload` 跑所有 disposer,再 `_reload`。
+Bob:`ACTIVE → UNLOADING → ACTIVE`。
+
+**阶段 5 — 搬出**
+物业通知:"8 楼合并完成,6 楼租户搬出"。`ctx.registry.delete(plugin)` 触发
+`Alice.fiber.dispose()`。Alice 的 disposer 按反向插入顺序执行。
+状态:`ACTIVE → UNLOADING → DISPOSED`。uid 置 null(再调 `ctx.effect()` 抛错)。
+
+要点:**Alice 从未写过一行清理代码**。她只管注册,物业负责撤销。
+这就是 Cordis 的核心承诺:**注册即效果——记下来,framework 收回**。
+
+## 五、Cordis 之上:DeepSeek Harness 加了什么
+
+```
+Cordis 提供           DeepSeek Harness 加什么
+─────────────────────────────────────────────────────
+DI                →   18 个 capability seam
+                     (LLM / Shell / FS / Subagent / ...)
+event bus         →   3 个 SessionEvent 类型域
+                     (session/event 模型真相源、agent/* 实时协调、capability/* 策略钩子)
+fiber 生命周期    →   turn / step 循环(inbox / claim / reject / drive)
+prototype scope   →   Layered Scope(可见性向下,事件向上)
+disposable        →   append-only Session 日志(turn 结束不能撤,只能补偿)
+```
+
+## 附录:源码索引
+
+本附录供查证。所有概念 / 模块对应的源码位置集中在此,正文不重复。
+
+| 概念 / 模块 | 源码定位 |
+|---|---|
+| Context | `vendor/cordis/src/context.ts:42-146` |
+| Fiber | `vendor/cordis/src/fiber.ts:184-754` |
+| Plugin | `vendor/cordis/src/registry.ts:92-146` |
+| Service | `vendor/cordis/src/service.ts:11-115` |
+| Event | `vendor/cordis/src/events.ts:131-352` |
+| Effect / Disposable | `fiber.ts:74-93`、`utils.ts:5-40` |
+| Isolation / Intercept / Mixin | `context.ts:121-125, 139-145`、`reflect.ts:364-390` |
+| Reflect / Proxy | `vendor/cordis/src/reflect.ts:133-418` |
+| Epoch | `vendor/cordis/src/fiber.ts:611-639` |
+| Symbol | `vendor/cordis/src/utils.ts:50-73` |
+| `context.ts` 模块 | `vendor/cordis/src/context.ts` |
+| `service.ts` 模块 | `vendor/cordis/src/service.ts` |
+| `fiber.ts` 模块 | `vendor/cordis/src/fiber.ts` |
+| `events.ts` 模块 | `vendor/cordis/src/events.ts` |
+| `registry.ts` 模块 | `vendor/cordis/src/registry.ts` |
+| `reflect.ts` 模块 | `vendor/cordis/src/reflect.ts` |
+| `utils.ts` 模块 | `vendor/cordis/src/utils.ts` |
+| 桶导出 | `vendor/cordis/src/index.ts` |
 
 ---
 
@@ -151,164 +387,6 @@ function handleError(info, reason, getOuterStack): never {
 ```
 
 `buildOuterStack`(`vendor/cordis/src/utils.ts:284-286`)惰性捕获注册点栈——所以外层上下文是 effect 注册的地方,而不是 effect 运行的地方。
-
----
-
-# 第三部分 — 具体比喻:共享办公楼
-
-> 用具体事物替换抽象概念,让每个机制变得可触摸。
-
-## 楼栋
-
-一个 **Cordis context 是一栋共享办公楼**:
-
-- **楼栋本身**是根 context。它有前台、广播系统、住户登记册、日志室。
-- 每个 **楼层**是一个 fiber——一个 plugin 实例。
-- 楼层之间通过 **电梯**(原型链)连通:5 楼想要打印机时,电梯自动先去 6 楼、再去楼顶找。
-- 一层楼只能看到自己楼层有的东西,除非它明确 inject 了上面的服务。
-
-## 注册 = 交钥匙
-
-Alice(一个 LLM provider)搬进来时:
-
-```ts
-ctx.on('meeting-start', () => console.log('hi'))
-ctx.effect(() => {
-  setInterval(() => logger.info('日报'), 1000)
-  return () => clearInterval(...)
-})
-```
-
-每登记一项,物业给她一把钥匙。钥匙上挂着标签:"这层楼拆除时,先做 X"。
-
-Alice 不需要记得什么时候取消任何东西。物业保管所有钥匙。当 Alice 搬出(她的 fiber 被 dispose),物业 **按反向顺序用完所有钥匙**,然后归档这层楼。
-
-与 `try { ... } finally { ... }` 的对比:那种模式要求 Alice 记得在哪一层清理。**Cordis 把"清理"从 plugin 作者的责任移交给 framework。**
-
-## PA 系统(事件)
-
-楼栋有一台 PA 系统,有 **五种使用方式**:
-
-| 模态 | 你说的话 | 发生什么 |
-|---|---|---|
-| `emit` | "下班了!" | 所有人都听到,没人等待 |
-| `parallel` | "5 点全员开会" | 所有人并行响应,你等所有人到齐 |
-| `serial` | "第一个同意的举手" | 你按顺序问,第一个同意的胜出 |
-| `bail` | "有人反对吗?" | 同步投票,首个反对胜出 |
-| `waterfall` | "3 号线 Bob 决定放行" | Bob 不接电话 → 否决;Bob 接 → 下一个人 |
-
-这些不是"快/慢"变体。它们是 **不同的社交协议**。Cordis 给它们分别命名,让调用者被迫选对。
-
-## 楼层隔离
-
-6 楼和 7 楼都有"会议室 A",但它们是不同的房间:
-
-```
-6F 会议室 A → CEO 专用
-7F 会议室 A → 部门专用,与 6 楼无关
-```
-
-```ts
-ctx.isolate('meeting-room-a')  // 创建一个新"分身",从此以下是新世界
-```
-
-技术上:物业给"会议室 A"分配一个 Symbol 作门牌号。6 楼用原 Symbol;7 楼用新 Symbol。登记册 `reflect.store` 用 Symbol 作 key——电梯自动查找当前楼层对应的房间。
-
-## Intercept(自顶向下规则级联)
-
-今天 CEO 宣布:"所有会议室从现在起必须有投影仪":
-
-```ts
-ctx.intercept('meeting-room', { projector: true })
-```
-
-规则按 **自顶向下** 叠加:楼顶先,6 楼次之,7 楼再次,plugin 自己的 inject 最后:
-
-```
-[ 6F 默认 { chair: 4 } ]          ← 最先
-+ [ 7F { projector: true } ]      ← 然后
-+ [ 8F { mic: 2 } ]               ← 最后
-= { chair: 4, projector: true, mic: 2 }
-```
-
-每个 plugin 不需要知道 CEO 的全局规则。它只声明"读我的 intercept 层 + 我自己的 inject",级联自动发生。
-
-## Mixin(共享打印机)
-
-6 楼前台有一台打印机,但每层楼都想直接 `ctx.print(...)`:
-
-```ts
-this.mixin('registry', ['plugin'])  // 把 `registry.plugin` 抄到 ctx 上
-```
-
-技术上:物业在每层楼装一个 **自动转发器** —— `ctx.plugin` 实际是 `ctx.registry.plugin.bind(ctx.registry)`。服务方法伪装成 context 原生方法;这是 Cordis API 能读起来像 `ctx.foo` 而不是 `ctx.inject('foo').getService('foo').method()` 的关键。
-
-## 完整生命周期故事
-
-> Alice 在 6 楼的小组被合并到 8 楼。
-
-```
-阶段 1 — 搬入
-  Alice 调用 ctx.plugin(MyLLMPlugin, { model: 'v4' })
-  → 物业给她一间房(Fiber)
-  → 她的钥匙环还空着,但已经挂在这层楼上
-  → 状态:PENDING(等待依赖)
-
-阶段 2 — 依赖到位
-  Bob 在 5 楼声明 inject = ['llm']
-  → Bob 这层楼开张;物业检查:Alice 的钥匙环需要 `llm`
-  → Bob 跑完;Alice 收到 `llm`
-  → Alice 状态:PENDING → LOADING → ACTIVE
-  → epoch 字符串变化:'__INACTIVE__' → ':1'(Bob 的 fiber uid)
-
-阶段 3 — 日常广播
-  ctx.events.emit('model-request', ...)
-  → PA 广播
-  → 所有订阅者并行触发
-  → Alice 的 listener 本身是注册过的 effect;这层楼拆除时,她的 listener 自动消失
-
-阶段 4 — 换供应商
-  物业通知:"LLM 供应商从 DeepSeek 换成 Pi-AI"
-  → 6 楼的 `llm` inject 被替换
-  → Bob 的 epoch 变化:':1' → ':2'
-  → Bob 的 epoch ≠ _runner.epoch → _unload()
-  → Bob:ACTIVE → UNLOADING → 所有 disposer 跑 → ACTIVE → _reload()
-
-阶段 5 — 搬出
-  物业通知:"8 楼合并完成,6 楼租户搬出"
-  → ctx.registry.delete(plugin)
-  → 物业调用 Alice 的 fiber.dispose()
-  → Alice 的 disposer 按反向插入顺序执行
-  → 状态:ACTIVE → UNLOADING → DISPOSED
-  → uid 置 null(再调 ctx.effect() 抛 INACTIVE_EFFECT)
-```
-
-要点:**Alice 从未写过一行清理代码**。她只管注册,物业负责撤销。这就是 Cordis 的核心承诺:"注册即效果——记下来,framework 收回。"
-
-## DeepSeek Harness 在 Cordis 上加了什么
-
-Cordis 是 **物业 + 楼层 + 钥匙 + PA**。DeepSeek Harness 是在这上面盖的 **有具体业务的大楼**——它要解决"agent 与 LLM 对话"这件事:
-
-```
-Cordis 提供           DeepSeek Harness 加什么
-─────────────────────────────────────────────────────
-DI                →   18 个 capability seam
-                     (LLM / Shell / FS / Subagent / ...)
-event bus         →   3 个 SessionEvent 类型域
-                     (session/event 模型真相源)
-                     (agent/* 实时协调)
-                     (capability/* 策略钩子)
-fiber 生命周期    →   turn / step 循环
-                     (一个 turn = 0+ 个 step)
-                     (inbox / claim / reject / drive)
-prototype scope   →   Layered Scope
-                     (可见性向下,事件向上)
-                     (skill registry 的 scoped layers)
-disposable        →   append-only Session 日志
-                     (turn 结束不能撤,只能补偿)
-```
-
-扩展比喻:Cordis 提供"钥匙环协议"。DeepSeek Harness 加"会议录音机"——每次会议(session turn)都永久写档,即使房间被拆(session turn 结束)录音也保留。DeepSeek Harness 还加了"应急守则"——agent 只能在自己的小范围内玩(scope)。
 
 ---
 
