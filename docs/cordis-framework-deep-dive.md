@@ -503,6 +503,7 @@ ctx.on('permission-check', (action) => {
   // 不 return = "没意见"
 })
 语义:bail 是 serial 的同步版本——同样 racing,只是不 await。
+
 5. 模态 5:waterfall — middleware chain
 const result = await ctx.waterfall('process', input,
   (input, next) => {
