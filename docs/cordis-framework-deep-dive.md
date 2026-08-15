@@ -788,21 +788,50 @@ get(receiver, error) {
 
 **定义**:让 `ctx.foo` 自动解析 service 的 Proxy 机制。
 
-**设计初衷**:经典 DI 要求 `ctx.inject('foo').getService('foo').method()`——啰嗦。
-Proxy 让 `ctx.foo` 触发 DI,API 简洁;同时,服务方法被调时 `this` 自动跟调用者 ctx。
+**设计初衷**:它解决的问题——经典 DI 太啰嗦
 
-**比喻**:电梯的自动导航——你说"我要打印机",电梯根据当前位置自动找到最近的,
-不需要你记"打印机的服务名是什么"。
+你见过的 DI 框架,服务调用长这样:
+ctx.inject('llm').getService().stream(...)
+ctx.getBean('llm').execute(...)
+container.resolve('llm').call(...)
+
+Cordis 想做的是:
+ctx.llm.stream(...)
+
+少一层包装,看起来像在读对象的属性。怎么做到的?Proxy。ctx 是一个 Proxy,不是普通对象
+new Context() 返回的不是普通的 Context 实例,而是包了一层 Proxy 的 Context。
+这意味着:你读 ctx 上的任何属性,都会被 Proxy 拦截,不会直接走普通的 JS 属性查找。
+
+Proxy 拦截后做什么?查三层:
+第 1 层:ctx 自己有的属性?
+  ├─ events、logger、reflect、registry、fiber、root → 这些是内置服务
+  │  → 直接返回
+  └─ 不是 → 走第 2 层
+
+第 2 层:在 service store 里找?
+  ├─ 找到了 → 返回这个 service(再包一层 Proxy,见下文)
+  └─ 找不到 → 走第 3 层
+
+第 3 层:你 inject 过这个 service 吗?
+  ├─ inject 过但找不到 → 抛 "依赖缺失"
+  └─ 没 inject 过 → 抛 "无此 property"
+所以 ctx.foo 不是"找属性",是"按规则层层查"。
+
+一句话回答"为什么需要 Proxy"
+让"读 ctx 的属性"看起来像普通属性访问,但实际触发 service store 查找 + service 方法的 this 绑定。 用户代码简洁,框架做对的事。
 
 ### 10. Symbol(共享符号表)
 
 **定义**:Cordis 用一组固定的 unique symbols 做协议标记。
 
-**设计初衷**:框架内部协议标记(`isolate` / `intercept` / `shadow` 等)
-不能撞用户起的属性名。用 Symbol 作 key,跨 realm 共享,字符串属性名互不干扰。
+**设计初衷**:框架内部协议标记(`isolate` / `intercept` / `shadow` 等)不能撞用户起的属性名。用 Symbol 作 key,跨 realm 共享,字符串属性名互不干扰。
 
-**比喻**:楼栋内部的"内部代号"——住户看不见的门牌号。物业靠代号管门,
-外人靠名字找房,两套编号互不冲突。
+Symbol 是 Cordis 在对象上贴的"内部标签",专门用来标记框架私有的元数据——因为 Symbol 不会跟用户的属性名撞车。
+
+这个有点像Python中的关键字，在编码时候是要可以避开的。
+Python 关键字和 Cordis Symbol 解决的是同一个问题:框架/语言需要一个"内部命名空间",防止跟用户的命名冲突。
+Python 的解法是:语言级别硬性禁止。
+Cordis 的解法是:用 Symbol 创建一个独立的、不可见的命名空间。
 
 ## 二、模块骨架(7 个 src 文件)
 
@@ -893,33 +922,6 @@ fiber 生命周期    →   turn / step 循环(inbox / claim / reject / drive)
 prototype scope   →   Layered Scope(可见性向下,事件向上)
 disposable        →   append-only Session 日志(turn 结束不能撤,只能补偿)
 ```
-
-## 附录:源码索引
-
-本附录供查证。所有概念 / 模块对应的源码位置集中在此,正文不重复。
-
-| 概念 / 模块 | 源码定位 |
-|---|---|
-| Context | `vendor/cordis/src/context.ts:42-146` |
-| Fiber | `vendor/cordis/src/fiber.ts:184-754` |
-| Plugin | `vendor/cordis/src/registry.ts:92-146` |
-| Service | `vendor/cordis/src/service.ts:11-115` |
-| Event | `vendor/cordis/src/events.ts:131-352` |
-| Effect / Disposable | `fiber.ts:74-93`、`utils.ts:5-40` |
-| Isolation / Intercept / Mixin | `context.ts:121-125, 139-145`、`reflect.ts:364-390` |
-| Reflect / Proxy | `vendor/cordis/src/reflect.ts:133-418` |
-| Epoch | `vendor/cordis/src/fiber.ts:611-639` |
-| Symbol | `vendor/cordis/src/utils.ts:50-73` |
-| `context.ts` 模块 | `vendor/cordis/src/context.ts` |
-| `service.ts` 模块 | `vendor/cordis/src/service.ts` |
-| `fiber.ts` 模块 | `vendor/cordis/src/fiber.ts` |
-| `events.ts` 模块 | `vendor/cordis/src/events.ts` |
-| `registry.ts` 模块 | `vendor/cordis/src/registry.ts` |
-| `reflect.ts` 模块 | `vendor/cordis/src/reflect.ts` |
-| `utils.ts` 模块 | `vendor/cordis/src/utils.ts` |
-| 桶导出 | `vendor/cordis/src/index.ts` |
-
----
 
 # 第二部分 — 设计哲学:七个核心命题
 
