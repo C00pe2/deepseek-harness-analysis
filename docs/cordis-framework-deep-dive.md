@@ -526,21 +526,94 @@ ctx.on('process', async (input, next) => {
 // 多个 listener 嵌套包裹,顺序 = 注册顺序的逆序
 语义:中间件 / 转换管道。每个 listener 包下一个,可以做 pre/post hook。可以否决(不调 next)。
 
+### 6. Epoch(epoch 字符串)
 
-### 6. Effect / Disposable
+**定义**:fiber 当前依赖集合的指纹字符串。
 
-**定义**:可被注册、撤销的副作用单元。
+**设计初衷**:plugin 的依赖图是动态的——服务被卸载 / 重载 / 替换。手动级联通知脆弱。Epoch 用一个字符串给依赖集合"指纹":变了说明依赖变了,触发 reload。
+
+epoch 是一个字符串,用 ':' + impl.fiber.uid 拼接每个 inject 依赖:
+_refresh() {
+  let epoch = ''
+  for (const name of Object.keys(this.inject)) {
+    const impl = this._store[name]
+    if (!impl) { epoch = INACTIVE; break }  // 缺失 → INACTIVE
+    epoch += ':' + impl.fiber.uid             // 拼接
+  }
+  this._setEpoch(epoch)
+}
+字符串相等性 = 依赖状态完全相同。
+- 同样的服务、同样的实现、同样的顺序 → 同样字符串 → 不动
+- 任一变化 → 字符串变 → 触发动作
+
+### 7. Effect / Disposable
+
+**定义**:Effect 是 Cordis 对"可撤销副作用"的统称;Disposable 是 effect 返回的撤销函数;Fiber 的 _disposables 列表把这两件事组装成完整的生命周期。
 每个注册 API(`plugin` / `on` / `provide` / `effect` / `accessor` / `mixin`)都是 effect,都返回 disposer。
 
-**设计初衷**:传统 framework 要求作者维护 listener 列表、写清理钩子、处理级联卸载,
-漏一处就泄漏。Cordis 统一承诺:**只管注册,不管清理**——
+**设计初衷**:传统 framework 要求作者维护 listener 列表、写清理钩子、处理级联卸载,漏一处就泄漏。Cordis 统一承诺:**只管注册,不管清理**——
 作者写 `() => { /* 副作用 */ }`,framework 决定何时撤销。
 
-**比喻**:钥匙扣。Alice 登记一项副作用,物业给她一把钥匙,钥匙上挂着
-"这层楼拆除时先做 X"。搬走时物业按反向顺序用完所有钥匙,
-Alice 从不写清理代码。
+**Framework 怎么决定何时撤销，规则是什么?**
+没有魔法,只有字符串比较。Framework 通过 5 种触发条件决定撤销,核心算法是"对比 epoch 字符串":变了就卸载/重载,没变就什么都不做。
+1. 显式手动撤销
+// 三种手动入口
+ctx.registry.delete(plugin)    // 1. 从 registry 删 plugin → 所有 fiber 撤销
+fiber.dispose()                // 2. 直接调某个 fiber 的 dispose
+dispose()                      // 3. ctx.on / ctx.effect 返回的 dispose 被调
+任何时候代码显式调 dispose,framework 立即执行撤销。
 
-### 7. Isolation / Intercept / Mixin(三个作用域操作符)
+2. Epoch 变 INACTIVE(依赖缺失)
+// 场景:某 plugin 提供 'fs',然后被 dispose
+ctx.registry.delete(fsPlugin)
+// → store 里 'fs' 的 Impl 被删除
+// → notify(['fs']) 触发所有 inject 'fs' 的 fiber
+// → 这些 fiber 的 _refresh() 发现 inject 里 'fs' 没 impl 了
+// → epoch = '__INACTIVE__'
+// → _setEpoch(INACTIVE) 触发 _unload
+规则:任何一个 inject 的服务消失,inject 它 fiber 必须 unload。
+
+3. Epoch 字符串变化(依赖换了)
+// 场景:替换 'fs' 的实现
+ctx.registry.delete(oldFsPlugin)
+ctx.provide('fs', newFsImpl)   // 不同的 fiber.uid
+
+// inject 'fs' 的 fiber:
+// epoch 旧:':5'(oldFs 的 uid)
+// epoch 新:':7'(newFs 的 uid)
+// 不同 → _setEpoch(newEpoch) 触发 unload → reload
+规则:依赖变了 = 重新评估 fiber 的 body(load)。
+
+4. HMR / config 更新
+// 场景:用户改了 cordis.yml,触发文件 watcher
+fiber.update(newConfig)
+// → 走 internal/update waterfall
+// → 重新 resolve config
+// → restart fiber(unload → reload)
+规则:config 改了 = 重新加载 fiber。
+
+5. 根 context dispose
+// 应用关闭时,根 context dispose
+ctx.dispose()
+// → 所有 fiber 反序撤销
+
+决策算法(核心)
+framework 决定"要不要撤销/重载"时,走这个流程:
+触发条件发生
+  ↓
+_fiber._refresh()                // 重算 epoch
+  ↓
+新 epoch == 旧 epoch?
+  ├─ 是 → 什么都不做(stable)
+  └─ 否 → 进入下一步
+  ↓
+新 epoch == INACTIVE?
+  ├─ 是 → _unload()(依赖缺失,只能撤销)
+  └─ 否 → _setEpoch(newEpoch)
+            ↓
+          _unload() + _reload()(依赖变了,卸载旧 + 加载新)
+
+### 8. Isolation / Intercept / Mixin(三个作用域操作符)
 
 **定义**:
 - `isolate(name, label?)` — 给同名 service 创建独立 Symbol key
@@ -555,7 +628,7 @@ Alice 从不写清理代码。
 - intercept = CEO 公告:"所有会议室必须有投影仪"(自顶向下级联)
 - mixin = 每层楼都能 `ctx.print(...)` 调前台打印机(service 方法伪装)
 
-### 8. Reflect / Proxy(反射层)
+### 9. Reflect / Proxy(反射层)
 
 **定义**:让 `ctx.foo` 自动解析 service 的 Proxy 机制。
 
@@ -564,17 +637,6 @@ Proxy 让 `ctx.foo` 触发 DI,API 简洁;同时,服务方法被调时 `this` 自
 
 **比喻**:电梯的自动导航——你说"我要打印机",电梯根据当前位置自动找到最近的,
 不需要你记"打印机的服务名是什么"。
-
-### 9. Epoch(epoch 字符串)
-
-**定义**:fiber 当前依赖集合的指纹字符串。
-
-**设计初衷**:plugin 的依赖图是动态的——服务被卸载 / 重载 / 替换。
-手动级联通知脆弱。Epoch 用一个字符串给依赖集合"指纹":
-变了说明依赖变了,触发 reload。
-
-**比喻**:每位住户的"供应商清单编号"。物业看编号:变了 = 换了供应商,
-需要重新签合同;没变 = 还是原班人马,啥都不动。
 
 ### 10. Symbol(共享符号表)
 
