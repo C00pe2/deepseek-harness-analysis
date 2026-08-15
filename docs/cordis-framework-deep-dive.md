@@ -546,6 +546,19 @@ _refresh() {
 - 同样的服务、同样的实现、同样的顺序 → 同样字符串 → 不动
 - 任一变化 → 字符串变 → 触发动作
 
+**什么变化才会影响epoch字符串？**
+Epoch 只对两个东西敏感:inject 集合本身、和提供每个 inject 的 fiber 的 uid。 其他一切变化都不影响 epoch。
+_refresh() {
+  let epoch = ''
+  for (const name of Object.keys(this.inject)) {   // ← inject 集合
+    const impl = this._store[name]
+    if (!impl) { epoch = INACTIVE; break }
+    epoch += ':' + impl.fiber.uid                   // ← 提供者的 fiber.uid
+  }
+  this._setEpoch(epoch)
+}
+两个变量 = inject 集合 + 提供者的 fiber.uid。 其他都不参与。
+
 ### 7. Effect / Disposable
 
 **定义**:Effect 是 Cordis 对"可撤销副作用"的统称;Disposable 是 effect 返回的撤销函数;Fiber 的 _disposables 列表把这两件事组装成完整的生命周期。
@@ -623,10 +636,153 @@ _fiber._refresh()                // 重算 epoch
 **设计初衷**:同名多实例、配置级联、服务方法伪装 ctx 方法——三者都是
 "在原型链上做不同映射"。Cordis 用同一套底层机制覆盖三种需要。
 
-**比喻**:
-- isolate = 6 楼和 7 楼各有"会议室 A"(同名不同房间)
-- intercept = CEO 公告:"所有会议室必须有投影仪"(自顶向下级联)
-- mixin = 每层楼都能 `ctx.print(...)` 调前台打印机(service 方法伪装)
+一、Isolate(同名多实例)
+问题: 同一个 service name,需要不同 scope 下指向不同实例。比如:
+- 测试 vs 生产的同一个服务名指向不同实现
+- 多个 agent 都需要 "LLM" 但用不同 model
+- 不同 preset 需要独立的子 agent 注册
+
+例子:公司里两个部门都有"经理"。A 部门的"经理"是 Alice,B 部门的"经理"是 Bob。你在公司目录下说"经理是谁",答案是 Alice;你跳进 B 部门的目录说"经理是谁",答案是 Bob。
+
+解法: 用 Symbol 隔离同一个 name 在不同 scope 下的 store key。
+const root = new Context()
+root.provide('meeting-room', ceoRoom)    // 用 root 的 isolate Symbol
+const child = root.isolate('meeting-room')   // 创建新 scope,'meeting-room' 改用新 Symbol
+child.provide('meeting-room', deptRoom)  // child 自己 scope 的 Symbol
+
+root['meeting-room']   // ceoRoom  ← root 的 Symbol
+child['meeting-room']  // deptRoom ← child 的 Symbol(isolate 后改的)
+
+相当于在每个"区域"里给这个名字发一个不同的身份证。所以虽然两个部门都叫"经理",但物业内部记录的是"经理 A 区-身份证 123"和"经理 B 区-身份证 456"。你问的时候物业看你站在哪个区,翻对应的身份证,告诉你对应的人。
+
+机制
+// context.ts:121-125
+isolate(name: string, label?: symbol) {
+  const shadow = Object.create(this[symbols.isolate])
+  shadow[name] = label ?? Symbol(name)   // ← 新 Symbol
+  return this.extend({ [symbols.isolate]: shadow })
+}
+// reflect.ts:286-287
+this.ctx.root[symbols.isolate][name] ??= Symbol(name)  // root 的固定 Symbol
+const key = this.ctx[symbols.isolate][name]            // 当前 scope 的 Symbol
+this.store[key] = impl                                  // store 用 Symbol 作 key
+JS 原型链查找自动按当前 scope 的 Symbol 解析,不需要任何特殊代码。
+
+实操场景
+// 创建两个独立的 LLM scope
+const root = new Context()
+root.provide('llm', prodLlm)
+
+const testing = root.isolate('llm')
+testing.provide('llm', mockLlm)
+
+// 测试场景用 testing 的 ctx
+testing.llm   // mockLlm
+root.llm      // prodLlm(不受影响)
+
+何时用
+- 测试场景需要 mock 某个 service
+- 多 agent / 多 preset 需要独立 LLM 配置
+- subagent 有自己的 ctx 树
+
+二、Intercept(配置级联)
+问题: 不同层级想覆盖某个 service 的 config,但不改源码:
+- 根 config 提供默认值
+- 用户层覆盖某些字段
+- 临时 session 再覆盖
+
+例子:连锁餐厅。总部定了菜单默认值(所有店都有);北京店想加北京烤鸭;上海店想减一道北方菜、加小笼包。每家店不需要重新写菜单,只需要说"我要加什么、减什么"。默认值由源头提供,每家店只关心自己改的部分。
+
+解法:沿原型链走 intercept map,合并所有 ancestor 的 config(root → leaf 方向)。
+class LlmRuntime extends Service {
+  static Config = Schema.object({
+    maxTokens: Schema.number().default(1000),
+    temperature: Schema.number().default(0.7)
+  })
+  constructor(ctx, config) {
+    super(ctx, 'llm')
+    // config 已经合并过所有 intercept 层
+    this.maxTokens = config.maxTokens   // 1000 或覆盖值
+    this.temperature = config.temperature
+  }
+}
+
+打开一个层(比如子 ctx),你说:"菜单里 maxTokens=500"。框架把所有层说过的话按"总部 → 分部 → 店"的顺序合并起来,合并后的菜单才是这家店实际用的。
+
+// 默认
+ctx.provide('llm', new LlmRuntime(ctx, defaultConfig))
+
+// 某个子 scope 覆盖
+ctx.intercept('llm', { maxTokens: 500 })
+// LlmRuntime 构造时拿到 { maxTokens: 500, temperature: 0.7 }
+// (没被覆盖的字段用 default)
+
+机制
+// service.ts:86-102
+[symbols.resolveConfig](base?: T, head?: T): T {
+  let intercept = this.ctx[Context.intercept]
+  const configs: any[] = []
+  while (this.name in intercept) {
+    if (Object.hasOwn(intercept, this.name)) configs.unshift(intercept[this.name])  // ← unshift:根在前
+    intercept = Object.getPrototypeOf(intercept)   // ← 沿原型链向上走
+  }
+  if (base) configs.unshift(base)
+  if (head) configs.push(head)
+  if (this['Config']?.merge) return this['Config'].merge(...configs)
+  return Object.assign({}, ...configs)
+}
+unshift 让根的 intercept 先合并,然后是更深的层级,最后是 plugin 自己的 base/head。
+合并方向
+[ 根 intercept: { maxTokens: 1000 } ]     ← 最先
++ [ 子 intercept: { maxTokens: 500 } ]    ← 然后覆盖
++ [ base config ]                         ← 然后
++ [ head config ]                         ← 最后
+= 合并结果
+
+何时用
+- 用户设置覆盖默认配置
+- Profile-level 配置覆盖 base
+- A/B testing 临时改某个参数
+
+三、Mixin(service 方法 → ctx 属性)
+问题: 每次都写 ctx.events.emit(...) 很啰嗦。想让 ctx.emit(...) 直接可用——但 emit 不是 ctx 的 own property,是 events service 的方法。
+
+例子:你手机里有"相机"App。你想拍照,需要从桌面找到相机图标、点开、点拍照按钮。三步。但你的锁屏上有一个"相机"快捷按钮。一点就拍照——你不用先打开相机 App 再点拍照。
+
+解法: 在 ctx 上创建 accessor,把对 ctx.foo 的访问转发到 ctx.<service>.foo。Mixin 不是"创造新方法",是"把 service 的方法复印一份快捷方式放在 ctx 上"。
+
+// 没有 mixin:
+ctx.events.emit('foo', data)   // 必须走 service
+
+// 有 mixin(emit 已 mix 到 ctx):
+ctx.emit('foo', data)          // 看起来是 ctx 方法,实际转发到 ctx.events.emit
+机制
+ReflectService 构造时预注册 4 个 mixin:
+// reflect.ts:219-222
+this.mixin('reflect', ['get', 'set', 'provide', 'accessor', 'mixin'])
+this.mixin('fiber', ['runtime', 'effect'])
+this.mixin('registry', ['inject', 'plugin'])
+this.mixin('events', ['on', 'once', 'parallel', 'emit', 'serial', 'bail', 'waterfall'])
+所以 ctx.emit ctx.on ctx.plugin ctx.inject ctx.provide 都是 accessor,转发到对应的 service。
+mixin(source, mixins) 是生成器 effect:
+// reflect.ts:364-390
+mixin(source, mixins) {
+  return this.ctx.fiber.effect(function* () {
+    const entries = Array.isArray(mixins) ? mixins.map(k => [k, k]) : Object.entries(mixins)
+    for (const [key, value] of entries) {
+      yield self.accessor(value, { get, set })   // ← 每个 mixin 创建 accessor
+    }
+  }, `ctx.mixin(${JSON.stringify(source)})`)
+}
+Accessor 的 getter
+get(receiver, error) {
+  const service = getTarget(this, error)        // this['events']
+  if (isNullable(service)) return service
+  const mixin = receiver ? withProps(receiver, service) : service
+  const value = Reflect.get(service, key, mixin)  // service[key],bind 到 ctx
+  // ...
+}
+关键:服务方法被调用时,this 跟调用者 ctx(自动绑方法)。
 
 ### 9. Reflect / Proxy(反射层)
 
