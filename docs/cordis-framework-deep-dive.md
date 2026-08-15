@@ -295,8 +295,99 @@ Cordis 的 plugin lifecycle 跟 OS fiber 很像:
 **设计初衷**:把"这个类实例代表一个能力"和"它对 ctx 可见"绑成一个动作。
 构造时自动 provide,消除"忘了 register 就用不上"的失误。
 
-**比喻**:一项楼内服务(前台、会议室)。服务提供者自己报名,
-其他楼层 inject 它就能调用——不需要主动打招呼。
+*Service = "服务"*——一个 ctx 上的命名能力。
+ctx.llm      // ← LLM 服务(能调模型)
+ctx.fs       // ← 文件系统服务(能读文件)
+ctx.shell    // ← shell 服务(能跑命令)
+ctx.agents   // ← agent 注册表服务(能创建 agent)
+你读 ctx 上的属性,拿到的不是普通数据,而是能做事的对象——这就是 service 的本质:能力。
+
+Service 的整个故事围绕两个核心动作展开:Provide(提供) vs Inject(需要)
+1. Provide = "我来提供这个服务"
+ctx.provide('llm', myLlmImpl)
+// 现在 ctx.llm === myLlmImpl
+或者用 Service 基类:
+class LlmRuntime extends Service {
+  constructor(ctx: Context) {
+    super(ctx, 'llm')   // ← 这一行等于 ctx.provide('llm', this)
+  }
+}
+super(ctx, 'llm') 内部就是调 ctx.reflect.provide('llm', this)。构造时自动注册,不会忘。
+
+2. Inject = "我需要这个服务"
+class MyPlugin {
+  static inject = ['llm']   // ← 声明依赖
+  apply(ctx) {
+    ctx.llm.stream(...)     // 用服务
+  }
+}
+声明 inject = ['llm'] 后,Cordis 会等 llm 服务注册了才让这个 plugin 启动。
+
+完整流程图
+Alice 的 LLM plugin 加载
+  ↓
+构造 LlmRuntime 实例
+  ↓
+super(ctx, 'llm')
+  ↓
+ctx.reflect.provide('llm', this)   ← 注册到 ctx 的 service store
+  ↓
+现在 ctx.llm === LlmRuntime 实例
+
+Bob 的工具 plugin 加载
+  ↓
+Bob 的 inject = ['llm']
+  ↓
+Bob 等 'llm' 出现(因为 inject 声明了)
+  ↓
+'llm' 已注册 → Bob 启动
+  ↓
+Bob.apply(ctx) 里调 ctx.llm.stream(...)
+
+**plugin和service是什么关系?**
+Plugin 是"加载动作"(跑一段代码);Service 是"命名对象"(出现在 ctx 上,可被读)。两者正交,可以互相嵌套。
+|维度|Plugin|Service|
+|---|---|---|
+|是什么|一段代码(function/class) |一个对象实例|
+|何时产生|ctx.plugin(p, config) 调用时|super(ctx, 'name') 或 ctx.provide('name', obj) 时|
+|出现位置|不直接出现——只产生副作用|直接以 name 为 key 出现在 ctx 上|
+|主要目的|注册副作用 / 提供服务|作为"可读的能力对象"|
+|状态|通常 stateless(每次跑都是新执行)|通常 hold 状态(配置、adapter 实例等)|
+Plugin 是动词,Service 是名词。
+
+它们可以互相嵌套——三种模式
+1. 模式 1:Plugin 提供 Service(最常见)
+Plugin body 里调 ctx.provide('name', obj),把一个对象注册成 service:
+class LlmPlugin {
+  static inject = ['config']
+  apply(ctx, config) {
+    const llm = new SomeLlmImpl(config)
+    ctx.provide('llm', llm)   // ← Plugin 提供一个 Service
+  }
+}
+
+ctx.plugin(LlmPlugin, { apiKey: 'xxx' })
+// 结果: ctx.llm === SomeLlmImpl 实例,由 LlmPlugin 的 fiber 拥有
+生命周期:Service 由 Plugin 的 fiber 拥有。Plugin unload → Service 自动消失。
+2. 模式 2:Service 类直接作为 Plugin 加载(更紧凑)
+Service 类本身就是 new (ctx, config) => any 的形状,符合 Plugin 接口——可以直接被加载为 Plugin:
+class LlmRuntime extends Service {
+  static inject = ['config']
+  static Config = Schema.object({ maxTokens: Schema.number() })
+  
+  constructor(ctx, config) {
+    super(ctx, 'llm')   // ← 这一行 = 自动 ctx.provide('llm', this)
+    // 初始化可以用 config (已经合并过 intercept)
+  }
+}
+
+ctx.plugin(LlmRuntime, { maxTokens: 1000 })
+// 结果: ctx.llm === LlmRuntime 实例,同时获得完整 lifecycle
+生命周期:Service 实例由 fiber 拥有。Plugin unload → fiber dispose → Service 自动从 ctx 消失。
+3. 模式 3:直接 provide,不走 Plugin
+const llm = new SomeLlmImpl()
+ctx.provide('llm', llm)   // ← 没有 fiber,没有 lifecycle
+生命周期:Service 跟普通对象一样,ctx 在就在,不在就不在。没有 plugin unload 自动清理这个福利。
 
 ### 5. Event(事件)
 
@@ -306,9 +397,134 @@ Cordis 的 plugin lifecycle 跟 OS fiber 很像:
 如果只有 `emit`,所有模式都被迫塞进一个 fire-and-forget 接口再手动加状态。
 Cordis 给五种语义独立命名,强迫调用者选对。
 
-**比喻**:楼栋的 PA 系统。"下班了" 是 `emit`,"5 点全员开会" 是 `parallel`,
-"第一个同意的举手" 是 `serial`,"有人反对吗" 是 `bail`,
-"3 号线 Bob 决定放行" 是 `waterfall`——五种开会议事的方式。
+Event 的三件套 + 五种分发模态
+
+一、三件套
+1. ctx.on(name, listener) — 注册 listener
+ctx.on('user-login', (userId) => {
+  console.log(`${userId} logged in`)
+})
+// 返回一个 disposer
+作用:把 listener 加入事件的监听列表。返回 disposer(不是 boolean,不是 Promise)。见下方dispose()
+
+2. ctx.emit(...) / parallel(...) / ... — 派发事件
+ctx.emit('user-login', 'alice-123')
+作用:触发事件,让所有 listener 被调用。5 种模态选哪种,决定 listener 怎么被调用。
+
+3. dispose() — 取消监听
+const dispose = ctx.on('user-login', handler)
+dispose()   // ← listener 从列表移除,之后不会再被调用
+作用:撤销注册。Listener 立刻从监听列表消失。Fiber unload 时,所有 listener 的 disposer 会自动跑——你也可以手动调。
+
+二、五种分发模态
+5 种模态的差异主要在三个维度:
+- 是否 await listener —— 是否等所有 listener 跑完才返回
+- 是否返回值 —— 调用方能不能拿到 listener 的返回值
+- 是否短路 —— 首个满足条件的 listener 之后是否还跑
+
+|模态|await?|返回 listener 值?|短路|
+|---|---|---|---|
+|emit|否|否|否|
+|parallel|是|否|否|
+|serial|是|是|是|
+|bail|否|是|是|
+|waterfall|可选|是|是(不调 next())
+
+下面逐个看。
+1. 模态 1:emit — fire-and-forget
+ctx.emit('user-login', userId)
+机制:
+- 立刻调每个 listener
+- 不 await listener 的返回值
+- 不收集返回值
+- 不抛异常(即使 listener throw,emit 也不抛——错被 logger 吞掉)
+listener 视角:
+ctx.on('user-login', (userId) => {
+  console.log(userId)   // 跑不跑完不影响 emit 调用方
+})
+语义:这是"广播通知",不是"问问题"。调用方发完就走,不在乎 listener 干啥。
+
+2. 模态 2:parallel — 并行 fan-out + 聚合
+try {
+  await ctx.parallel('before-save', document)
+  // 所有 listener 并行跑,等所有人完成
+} catch (e) {
+  // 任何一个 listener throw → 整个 parallel throw AggregateError
+}
+机制:
+- 所有 listener 并行启动(Promise.all)
+- await 所有人完成
+- 任一 reject → 抛 AggregateError
+listener 视角:
+ctx.on('before-save', async (doc) => {
+  await cache.invalidate(doc.id)   // 异步操作 OK
+  await log.record('save', doc)
+})
+语义:多个订阅者独立做事,且所有人得跑完才能继续。任一失败 → 整个失败。
+
+3. 模态 3:serial — 有序 racing
+const handler = await ctx.serial('resolve-handler', request)
+// listener 按注册顺序跑
+// 第一个返回非 null/false/undefined 的胜出
+// 后面不再跑
+// handler = 胜出 listener 的返回值
+机制:
+- listener 按注册顺序,串行 await(不是并行)
+- 每跑完一个,检查返回值
+- 第一个"有意义"的返回(非 null/false/undefined)胜出,链停
+- 如果所有 listener 都返回"无意见"(null/undefined/false),serial 整体也返回 undefined
+listener 视角:
+// 注册顺序:plugin A 先,plugin B 后
+ctx.on('resolve-handler', (req) => {
+  if (req.type === 'special') return specialHandler
+  // 不 return = undefined = "我处理不了,问下一个"
+})
+
+ctx.on('resolve-handler', (req) => {
+  return defaultHandler  // 默认 handler,啥都接
+})
+// 普通请求由第二个 listener 接收;特殊请求由第一个
+语义:"第一个能处理的负责",有顺序(先注册的先尝试)。
+
+4. 模态 4:bail — 同步 voting
+const veto = ctx.bail('permission-check', action)
+// 同步跑 listener,首个返回非空对象胜出
+// 没 await
+机制:
+- 同步跑 listener(不是 async,不用 await)
+- 第一个返回非 null/false/undefined 的胜出
+- 同步返回结果
+- 没异步支持——listener 不能是 async function
+listener 视角:
+ctx.on('permission-check', (action) => {
+  if (action.type === 'dangerous') {
+    return { allowed: false }   // 否决
+  }
+  // 不 return = "没意见"
+})
+语义:bail 是 serial 的同步版本——同样 racing,只是不 await。
+5. 模态 5:waterfall — middleware chain
+const result = await ctx.waterfall('process', input,
+  (input, next) => {
+    const step1 = doStep1(input)
+    return next(step1)   // ← 关键:调 next 才继续
+  }
+)
+机制:
+- listener 是 (args, next) => result
+- next 是 args 最后一个参数,调用 next 才进入下一个 listener
+- 不调 next = 否决整条链(包括最终的 builtin behavior)
+- 链结束时,所有 listener 嵌套包裹,每个监听者有机会"包住"下一个
+listener 视角:
+ctx.on('process', async (input, next) => {
+  console.log('before')
+  const output = await next(input)   // ← 进下一个 listener
+  console.log('after')
+  return output
+})
+// 多个 listener 嵌套包裹,顺序 = 注册顺序的逆序
+语义:中间件 / 转换管道。每个 listener 包下一个,可以做 pre/post hook。可以否决(不调 next)。
+
 
 ### 6. Effect / Disposable
 
