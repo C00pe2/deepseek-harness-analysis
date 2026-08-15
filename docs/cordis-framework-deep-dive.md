@@ -22,9 +22,9 @@ Cordis 围绕一个问题展开:**如何让独立的、可复用的能力单元(
 2. **时序(生命周期)**:plugin 的加载顺序未定;插件可能要异步加载,必须等待依赖、必须优雅卸载、必须不泄漏地重载。
 3. **空间(隔离)**:同一个服务名在不同场景(测试 vs 生产、本地 vs 远程)下指向不同实现;它们互不污染。
 
-想象一下，传统软件工程中，当你需要上线一个新服务的时候，你需要：先停机，写代码，合代码，部署发布，上线测试；为了避免架构大改，因此在设计之初就要尽可能解耦，避免逻辑耦合导致架构演进困难。
+想象一下,传统软件工程中,当你需要上线一个新服务的时候,你需要：先停机,写代码,合代码,部署发布,上线测试；为了避免架构大改,因此在设计之初就要尽可能解耦,避免逻辑耦合导致架构演进困难。
 
-而Cordis的解决方案是**运行时加载+服务可逆**。即不用停机，就可以在运行时加载、卸载、重载插件。而每个插件在卸载时，会干净地、完整地把自己引入的所有内容都清理掉。
+而Cordis的解决方案是**运行时加载+服务可逆**。即不用停机,就可以在运行时加载、卸载、重载插件。而每个插件在卸载时,会干净地、完整地把自己引入的所有内容都清理掉。
 
 经典 DI 框架(Guice、Spring、NestJS)在 (1) 上做得好。(2) 和 (3) 通常需要手写 `start`/`stop` 钩子加配置 profile —— 当 plugin 数量大、重载频繁、HMR 介入时,这种手工钩子会脆裂。
 
@@ -42,13 +42,159 @@ Cordis 围绕一个问题展开:**如何让独立的、可复用的能力单元(
 
 ### 1. Context
 
-**定义**:原型链作用域 + 内置服务的根容器。
+**用法预览**(6-8 行)
+  const root = new Context()
+  const child = root.extend()
+  child.provide('fs', new LocalFileSystem(...))
+  child.fs
+  root.fs
+  child.fs.readFile('x.txt')
 
-**设计初衷**:让 scope 复用 JS 原生查找语义,不引入新的 DI token 词汇。
-子 context 自动继承父的所有属性,prototype chain 即 scope。
+**定义**:JS 对象,其原型链即 scope 继承链;自身挂载 4 个内置服务(events / logger / reflect / registry)和一个 fiber。
 
-**比喻**:一栋共享办公楼。楼栋本身是根 context;5 楼想要打印机时,
-电梯(原型链)自动先上 6 楼、再上顶楼——不写专门代码。
+**设计初衷**:不发明新 DI 词汇,让读服务看起来像读属性。
+
+**什么是原型链？**
+
+JavaScript 的对象继承机制。每个 JS 对象都有一个隐藏的"父对象"链接,叫 prototype。读属性时找不到,JS 就顺着这个链接往上找,直到找不到为止。这条从对象出发,沿 prototype 一路向上的链,就叫"原型链"。
+
+用最简例子建立直觉
+```
+const parent = { greeting: 'hello' }
+const child = Object.create(parent)   // ← 关键:child 的"父对象"是 parent
+child.name = 'Alice'
+
+console.log(child.name)       // 'Alice'  — child 自身有这个属性
+console.log(child.greeting)   // 'hello'  — child 没有,但 parent 有,JS 顺着链找到
+console.log(child.color)      // undefined — 链走到 null 都找不到
+```
+
+Object.create(parent) 这一行的含义:*"创建一个新空对象,把这个新对象的 prototype 指向 parent"*。这个新对象就叫 child,它的"父亲"是 parent。
+读属性的查找顺序(JS 引擎规则)
+读 child.xxx 时,JS 按这个顺序查:
+1. child 自身有没有 xxx? → 有就用,没有继续
+2. child 的 prototype(也就是 parent)有没有 xxx? → 有就用,没有继续
+3. parent 的 prototype(Object.prototype)有没有 xxx? → 有就用,没有继续
+4. Object.prototype 的 prototype 是 null → 彻底找不到,返回 undefined
+这条从对象出发,沿 prototype 一路向上的链,就叫"原型链"。
+
+Cordis 的 Context 树是这样构造的:
+class Context {
+  constructor() {
+    /* ... */
+  }
+  extend(meta = {}) {
+    const self = Object.create(getTraceable(this, this))   // ← 关键
+    for (const prop of Reflect.ownKeys(meta)) {
+      Object.defineProperty(self, prop, Reflect.getOwnPropertyDescriptor(meta, prop)!)
+    }
+    return self
+  }
+}
+extend() 的核心就是 Object.create(parent)。这意味着:
+const root = new Context()       // root 有 events / logger / reflect / registry
+const child = root.extend()      // child 的 prototype 是 root
+const grandchild = child.extend()  // grandchild 的 prototype 是 child
+读 grandchild.logger 时,JS 自动沿 prototype 链:
+- grandchild 自身有没有 logger? 没有
+- grandchild 的 prototype 是 child,child 有没有? 没有(我们没注册)
+- child 的 prototype 是 root,root 有吗? 有!
+- 返回 root 上挂的那个 logger service
+整个查找过程不需要 Cordis 写一行"lookup service"的代码——JS 引擎自己完成。
+
+**Cordis 为什么这么选**
+1. 零新词汇:scope / inheritance / lookup 都是 JS 已经有的概念,作者不用学新东西
+2. 零额外开销:JS 引擎的 prototype lookup 是 C++ 级别优化
+3. shadowing 天然支持:在 child 上设同名 own property,自动覆盖 parent——Cordis 的 intercept() / isolate() 用这一性质
+4. Proxy 增强:Cordis 在 Context 上加了 Proxy handler,使得"找不到的属性"自动 fallback 到 service store 查找——prototype 链查完了 JS 没找到,Cordis 才接手
+一个 Cordis 真实场景
+```
+const root = new Context()
+const child = root.extend()
+child.provide('fs', new LocalFileSystem(...))
+
+// 读 root.fs
+// 1. root 自身有 fs 吗? 没有
+// 2. root 的 prototype 是 Object.prototype,有 fs 吗? 没有
+// 3. JS 走完链,放弃
+// 4. ReflectService.handler.get trap 接管
+// 5. trap 发现 root 没注入 fs,但 child 注入了——
+//    Proxy 不会"往上"找,但 ctx 本身的 fiber 是同一个 root
+//    所以 root 的 ReflectService 也能看到 child 的 provide?
+//    —— 实际上不对,provide 是注册到 root 的 store 上,
+//    因此 root.fs 也能读到,这是 fiber 链的另一回事
+```
+
+注意最后一点:prototype 链管不了 service store 的查找,store 查找走的是 fiber 链。这两条链在 Cordis 里是两件事:
+- prototype 链 = JS 原生对象继承(管 own property + 静态定义的服务)
+- fiber 链 = ctx.fiber.parent.fiber.parent.fiber...(管 service store 查找)
+Cordis 把这两条链组合起来用——prototype 链负责"哪些属性我能读",fiber 链负责"这些属性对应的 service 实现从哪来"。
+fiber链后续我们再详细展开
+
+**为什么是 JS 的原型链,而不是其他语言的继承**
+一句话解释：Java / C++ / Python / C# 的继承都是类继承(class-based inheritance),无法在运行时动态改变。
+JS 的原型链是对象继承(object-based inheritance)——不是类之间的关系,是对象之间的关系：任何对象可以在运行时改变自己的 prototype；任何对象可以在运行时给 prototype 加属性,这符合Cordis的设计初衷：运行时动态改变服务。
+
+具体场景:
+1. Context.extend() 运行时建父子
+class Context {
+  extend(meta = {}) {
+    const self = Object.create(getTraceable(this, this))   // ← 运行时建子
+    // ...
+  }
+}
+你调 ctx.extend() 时,Cordis 当场建一个新对象,挂到 prototype 链上。在 Java 里这等于"运行时凭空造一个类的子类"——做不到。在 JS 里就是一行。
+
+2. provide() 运行时挂服务
+child.provide('fs', new LocalFileSystem(...))
+provide 在 root context 的 service store 里插入一条实现,这个 store 本身是个普通对象,运行时可改。Java 里的 Spring container 要做类似事,得用反射 + 字节码编织 + 重启 classloader——复杂且脆弱。
+
+3. intercept() 运行时叠配置
+ctx.intercept('llm', { maxTokens: 1000 })
+每次 intercept 都在 prototype 链上加一层 mapping——运行时累加,运行时撤销(disposer)。Java 里的类似操作要么"重启应用",要么用 AOP 编织——都不是"自然"的写法。
+
+4. HMR(代码热重载)
+vendor/hmr/src/index.ts 监听文件,改完直接 reload fiber。整个 prototype 链可重建——因为对象关系在 JS 里就是数据,改完重新 Object.create 即可。Java 里的 hot reload 要 JVMTI + 自定义 classloader,本质上是"绕开 JVM 的限制"。
+
+5. Isolate 运行时建独立 scope
+const isolated = ctx.isolate('meeting-room')
+isolate 创建一个新 context,Symbol 作 service key——两个 Symbol 在同一对象上可以独立存活。类继承做不到"同名属性有多个版本",prototype 链 + Symbol 天然支持。
+
+当然,存在语言具备类似的能力,但因为语言生态或者功能不完善,所以没有被广泛使用：
+Python 有 __mro__ 多继承 + 动态类创建(type() 元类),能模拟一部分。但 Python 类的元类是固定的,运行时改 MRO 是反模式,社区不推荐。
+Lua 有 metatable,机制上和 JS prototype 几乎一样——Lua 也能写 Cordis。Cordis 没选 Lua 是生态原因(没有 npm、TypeScript、Web 平台原生集成)。
+Ruby 有 singleton class / eigenclass,部分支持动态扩展,但每次开新对象都要走 class system。
+Self 语言——JS 的 prototype 链就是从 Self 抄的。Self 是第一个把"对象继承对象"做到极致的语言。
+
+**深挖一层：为什么 JS 原型链可以在运行时继承对象**
+根本原因:JS 对象结构层面的设计
+JS 对象本质上就是两个东西:
+```
+const obj = { x: 1 }
+// 内部上,obj 实际是:
+// {
+//   [[Prototype]]: Object.prototype,   ← 一个普通的可读写槽
+//   x: 1                                ← 普通属性
+// }
+```
+[[Prototype]] 是一个数据槽,不是固化的元数据
+JS 把"父对象引用"设计成运行时可写的数据,这是从语言设计层就定下的——不是引擎优化,不是语法糖,是核心数据结构就是这样的。
+
+**Scope 是怎么"工作"的**
+```
+root.provide('fs', rootFs)        // 在 root scope 注册 fs
+child.provide('auth', childAuth)  // 在 child scope 注册 auth
+
+root.fs      // rootFs     ← 自己 scope 注册的
+root.auth    // undefined  ← child scope 注册的,root 看不见
+
+child.fs     // rootFs     ← 继承自 root scope
+child.auth   // childAuth  ← 自己 scope 注册的
+
+grandchild.fs    // rootFs     ← 沿 prototype 链继承到 root
+grandchild.auth  // childAuth  ← 沿 prototype 链继承到 child
+```
+Scope 继承是单向向下的:child 看得见 parent,parent 看不见 child。这个符合大家对继承的一贯理解
 
 ### 2. Fiber
 
