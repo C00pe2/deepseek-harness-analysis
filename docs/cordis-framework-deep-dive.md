@@ -196,25 +196,97 @@ grandchild.auth  // childAuth  ← 沿 prototype 链继承到 child
 ```
 Scope 继承是单向向下的:child 看得见 parent,parent 看不见 child。这个符合大家对继承的一贯理解
 
-### 2. Fiber
-
-**定义**:plugin 的运行时实例 + 副作用集合 + 生命周期状态机。
-
-**设计初衷**:一个 plugin 可被加载多次,每次加载需要独立的生命周期和副作用隔离。
-把"运行时实例"和"它产生的所有副作用"绑在一起,就能一次 unload 一并清理。
-
-**比喻**:一层楼就是一个 fiber。Alice 在 6 楼注册的所有 listener、interval、
-event handler 都挂在这层楼上,搬走时一并带走。
-
-### 3. Plugin
+### 2. Plugin
 
 **定义**:可被加载的能力单元,三种形状(函数 / 类 / 对象)。
 
 **设计初衷**:三种形状对应不同写作风格——函数最小、类适合 OO 继承、对象适合带元数据。
 框架归一化这三种形状,统一加载和元数据协议。
 
-**比喻**:一份"入住申请表"。函数是手写一段话、类是填表、对象是带附件的完整材料。
-物业不管形状,只看 inject 声明和 Config schema。
+**什么是 plugin(插件)**
+Plugin = 一段往 ctx 上注册东西的代码。例:
+```
+const myLoggerPlugin = (ctx, config) => {
+  ctx.on('request-start', () => console.log('request started'))
+  setInterval(() => console.log('tick'), 1000)
+  ctx.provide('logger', { info: (msg) => console.log(msg) })
+}
+```
+这段代码本身是死的(只写在那里,没跑)。plugin 必须被加载才会执行。
+
+并且，同一个 plugin 可以被加载多次
+```
+ctx.plugin(myLoggerPlugin, { name: 'logger-A' })  // 加载第一次
+ctx.plugin(myLoggerPlugin, { name: 'logger-B' })  // 加载第二次
+两次加载跑的是同一段代码,但两次是完全独立的实例——各自的 config、各自的副作用、各自的生命周期。
+如果只卸载 logger-A,logger-B 完全不受影响。
+```
+
+**什么是副作用**
+一句话解释：一个函数除了"算一个返回值"以外,对外部世界做的任何事。任何超出本职的事——写终端、改全局变量、启动 timer——都是可以认为是副作用。
+比如：
+ctx.on(...) 注册了一个 listener。
+setInterval(...) 启动了一个 timer。
+ctx.provide(...) 注册了一个 service。
+这些都是副作用。如果 fiber A 卸载时不清理:
+- listener 还在响应事件 → 内存泄漏 + 行为异常
+- timer 还在跑 → 持续输出
+- service 还在 store 里 → 别的 fiber 还在用它
+
+### 3. Fiber
+
+**定义**:plugin 的运行时实例 + 副作用集合 + 生命周期状态机。
+
+**设计初衷**:一个 plugin 可被加载多次,每次加载需要独立的生命周期和副作用隔离。
+把"运行时实例"和"它产生的所有副作用"绑在一起,就能一次 unload 一并清理。
+
+Fiber = "一个 plugin 的一次加载实例",它拥有:
+- 这次加载的 config
+- 这次加载产生的所有副作用(listener / timer / service / 等)
+- 自己的生命周期状态机
+
+**Fiber 的关键事实**
+1. 一个 plugin 对应一个 Fiber,但多次加载对应多个 Fiber
+ctx.plugin(myPlugin, { ... })  // Fiber 1
+ctx.plugin(myPlugin, { ... })  // Fiber 2
+两个 Fiber,跑同一段 plugin 代码,但独立。
+
+2. Fiber 的"_disposables"是副作用集合
+// fiber.ts:202-203
+public readonly _disposables = new DisposableList<Disposable>()
+每个 fiber 持有这个 list。Plugin body 注册的每项副作用都进 list。
+// fiber.ts:520
+removeWrapper = this._disposables.push(wrapper)
+注册即加入。注册 = effect,disposer 进 fiber 的 disposables。
+
+3. Fiber 有生命周期状态机
+// fiber.ts:147-154
+const enum FiberState {
+  PENDING,    // 等待依赖
+  LOADING,    // plugin body 正在跑
+  ACTIVE,     // 正常运行
+  FAILED,     // 启动失败
+  UNLOADING,  // 正在撤销
+  DISPOSED,   // 已删除
+}
+状态转移:
+PENDING → LOADING → ACTIVE       正常启动
+ACTIVE   → UNLOADING → DISPOSED  卸载
+ACTIVE   → UNLOADING → ACTIVE    重载(配置变了)
+任何态 → FAILED                   启动报错
+
+4. Fiber 是 Context 的"住户"
+Fiber 跟 Context 一一对应:
+- 一个 Context 有一个 fiber 字段
+- 一个 fiber 有一个 ctx 字段
+- Fiber 是"plugin 在这个 context 里住着的状态"
+
+**为什么叫"Fiber"**
+这个词来自 OS 调度术语。Fiber = 轻量级线程——有自己的执行状态,但合作式调度(不是抢占式)。
+Cordis 的 plugin lifecycle 跟 OS fiber 很像:
+- 每个 plugin 在自己的 fiber 上跑
+- 每个 fiber 有自己的状态
+- 调度是合作式的(framework 决定何时 unload)
 
 ### 4. Service
 
