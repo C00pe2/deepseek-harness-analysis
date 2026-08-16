@@ -881,33 +881,69 @@ events.ts  registry.ts  reflect.ts  service.ts
 
 ## 四、把它们串起来看:完整生命周期
 
-> Alice(LLM provider)在 6 楼的小组被合并到 8 楼。
+> 一家餐厅的故事:主厨 Alice 入职,做菜,被合并,离职。
 
-**阶段 1 — 搬入**
-Alice 调用 `ctx.plugin(MyLLMPlugin, { model: 'v4' })`。物业给她一间房(Fiber),
-钥匙环空着但已挂这层楼。状态:`PENDING`(等待依赖)。
+**阶段 1 — 入职(`PENDING`)**
+Alice 来餐厅报到,被分到"热菜 6 号工位"(Fiber)。
+工位还空着——她宣布"我需要食材才能开火",物业在工位门口贴上"等食材到"。
 
-**阶段 2 — 依赖到位**
-Bob 在 5 楼声明 `inject = ['llm']`。Bob 开张,物业检查:Alice 的钥匙环需要 `llm`。
-Bob 跑完,Alice 收到 `llm`。状态:`PENDING → LOADING → ACTIVE`。
-epoch 变化:`'__INACTIVE__' → ':1'`(Bob 的 uid)。
+```ts
+ctx.plugin(chefAlicePlugin, { station: 'hot-6' })
+// 物业给她一个工位(Fiber),钥匙环空着但已挂这工位
+// 状态:PENDING(等食材)
+```
 
-**阶段 3 — 日常广播**
-`ctx.events.emit('model-request', ...)`。PA 广播,所有订阅者并行触发。
-Alice 的 listener 本身是注册过的 effect;这层楼拆除时,她的 listener 自动消失。
+**阶段 2 — 食材到位(`LOADING → ACTIVE`)**
+供应商送来 `tomato` 和 `garlic`,在仓库登记。
+物业检查 Alice 工位的需求:她需要 `tomato` 和 `garlic`——都到了。
+Alice 拿到钥匙,开始备料(跑 plugin body)。
 
-**阶段 4 — 换供应商**
-物业通知:"LLM 供应商从 DeepSeek 换成 Pi-AI"。6 楼的 `llm` inject 被替换。
-Bob 的 epoch 变化:`':1' → ':2'`。Bob `_unload` 跑所有 disposer,再 `_reload`。
-Bob:`ACTIVE → UNLOADING → ACTIVE`。
+```ts
+ctx.provide('tomato', tomatoBatch)
+ctx.provide('garlic', garlicBatch)
+// 物业查:Alice 的 inject 依赖都到位了
+// 状态:PENDING → LOADING → ACTIVE
+// 食材清单编号变化:'__INACTIVE__' → ':tomato:garlic'(epoch)
+```
 
-**阶段 5 — 搬出**
-物业通知:"8 楼合并完成,6 楼租户搬出"。`ctx.registry.delete(plugin)` 触发
-`Alice.fiber.dispose()`。Alice 的 disposer 按反向插入顺序执行。
-状态:`ACTIVE → UNLOADING → DISPOSED`。uid 置 null(再调 `ctx.effect()` 抛错)。
+**阶段 3 — 营业(emit)**
+餐厅开始接单:`ctx.emit('order', { dish: 'stir-fry' })`。
+所有员工(listener)同时收到——洗碗的备盘子,前台的准备喊号,Alice 开始炒菜。
+每个员工忙完就回去等下一单——他们都是 effect,Alice 离职时跟着走。
 
-要点:**Alice 从未写过一行清理代码**。她只管注册,物业负责撤销。
-这就是 Cordis 的核心承诺:**注册即效果——记下来,framework 收回**。
+```ts
+ctx.emit('order', { dish: 'stir-fry' })
+// 物业 PA 喊一声
+// 所有订阅的 listener 并行触发
+// Alice 自己的 listener(厨房工单)也是 effect,她走时自动撤销
+```
+
+**阶段 4 — 换供应商(reload)**
+食材供应商从"老张"换成"小李"——`tomato` 这条线换了新货。
+物业检查:Alice 的清单编号从 `':tomato:garlic'` 变成 `':tomato-new:garlic'`。
+编号变了——Alice 重新备料(卸旧 + 装新),但工位不动。
+
+```ts
+ctx.registry.delete(oldTomatoSupplier)
+ctx.provide('tomato', newTomatoBatch)
+// 物业通知所有工位:tomato 变了
+// Alice 的食材清单编号变了(epoch 不同)
+// Alice:ACTIVE → UNLOADING(撤旧备料)→ ACTIVE(用新食材重新备料)
+```
+
+**阶段 5 — 离职(`DISPOSED`)**
+餐厅合并,6 号工位撤销。`ctx.registry.delete(chefAlicePlugin)`。
+物业执行 Alice 的工位撤离清单(dispose 链):清冰箱、洗厨具、归还钥匙、撕工位标签。
+工位拆除,Alice 的 uid 置 null(再来这个工位就报错"工位已撤销")。
+
+```ts
+ctx.registry.delete(chefAlicePlugin)
+// 物业执行 Alice 的所有清理:
+//   1. 移除她的 listener
+//   2. 撤销她的 timer(炖汤忘了关火这种事)
+//   3. 撤销她注册的 service
+// 状态:ACTIVE → UNLOADING → DISPOSED
+```
 
 ## 五、Cordis 之上:DeepSeek Harness 加了什么
 
@@ -1583,3 +1619,4 @@ Proxy handler 的 `get` 见到 `def?.type === 'accessor'` 就调 `def.get.call(c
 # 第六部分 — 一句话总结
 
 Cordis 的核心思想不是"plugin framework",而是 **"原型链作用域上的 disposable effect"**。其余都是在这对原语上的工程精修。
+
