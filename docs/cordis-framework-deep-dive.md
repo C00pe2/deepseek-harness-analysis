@@ -1092,367 +1092,354 @@ function handleError(info, reason, getOuterStack): never {
 ## 核心问题
 Cordis解决的是“如何把插件拼在一起”，DSH需要回答：
 1. 如何驱动一个Agent的对话循环?(Agent Loop)
+用户输入 → Inbox 排队 → driver 唤醒 → turn 循环(每个 step:抢消息 / 拼 prompt / 调 LLM / 跑 tool)→ 结果落 session log → 回屏幕。
+6 个核心节点
+用户键入 ──① Inbox──② wakeDriver──③ turn 循环──④ step(LLM call)──⑤ tool 执行──⑥ 屏幕
+          (持久化)    (idle→running)  (turn/step event)  (chunk/message)  (call/result)   ↑
+                                                          │                              │
+                                                          └──── Session log ◀────────────┘
+一句话本质
+整条链路是单向数据流——LLM 只能通过 tool call 反过来影响 session log,没有"模型直接改写 log"的捷径。这就是"模型可见 = 日志可重建"的不变式。
+
+6 个环节对应 package
+|环节|Package|角色|
+|---|---|---|
+|① Inbox 排队|packages/core/agent/|AgentRegistry + Inbox + initiator AsyncLocalStorage|
+|② wakeDriver|packages/core/agent-loop/|ReactLoopAgent 状态机(idle/running 转换)|
+|③ turn 循环|packages/core/agent-loop/|turn()/step() 主体,turn/start/step/end event|
+|④ step + LLM call|core/agent-loop + core/llm/|buildRequest + llm.stream + BlockAssembler|
+|⑤ tool 执行|packages/core/tools/	5 阶段 pipeline|(pre-execute/execute/post-execute/result)|
+|⑥ 屏幕输出|Web UI / ACP / CLI|UI 层(不是 agent-loop 本身)|
+
 2. 如何让模型看到正确的上下文?(Session log + system prompt)
+*prompt 是"拼出来的字符串",messages 是"从 session log 投影出来的"*——两件事各管一段。
+4 个 prompt 来源
+LLM 看到的内容
+├─── system 字段(prompt 拼出来的)
+│     ├─ sections(按 order 排序的文本段)
+│     ├─ contexts(运行时快照,如 cwd)
+│     ├─ tools(模型可见的工具 schema)
+│     └─ variables(`{{name}}` 替换)
+└─── messages 数组(session log 投影)
+      ├─ user/message(直接 surface)
+      ├─ assistant/message(content blocks)
+      └─ tool/result(跟 tool/call 配对)
+4 个 Cordis 原语各管一段
+|概念|用途|
+|---|---|
+|SurfaceManager|维护"模型可见的 event seq 列表"——决定哪些 event 进 messages|
+|ScopedLayers|同名 section 在 agent scope shadow 全局——决定 prompt 内容|
+|system-prompt/assemble waterfall|允许 plugin 改 assembly——决定 prompt 最终形态|
+|request/header 增量 fold|每次 buildRequest 比对前一次,只在变化时写 log|
+
 3. 如何让Agent调用工具?(tool registry + executrion pipeline)
-4. 如何让所有能力可替换?(capability seams: 文件系统、shell、子进程、web 搜索)
-5. 如何持久化对话? (session persitence)
-6. 如何从配置组合出一个完整的Agent? (profiles + bundles + pressets)
-7. 如何让人类审批Agent的危险操作? (approval + permission)
+两件事
+如何让Agent调用工具 = 
+  ① Tool Registry(怎么注册 + 怎么让 LLM 看到工具)
+  ② Execution Pipeline(LLM 决定调用后,实际怎么跑)
+① Tool Registry(注册 + 可见性)
+LLM 怎么"看到"工具
+packages/core/tools/src/index.ts 提供 4 个 API 让 plugin 注册工具:
+// 工具作者(plugin 端)调用:
+ctx.tools.register({
+  name: 'read_file',
+  description: '...',
+  parameters: Schema.object({ path: Schema.string() }),
+  // optional:
+  execute: async (args, exec) => { /* tool 实现 */ },
+  isConcurrencySafe: (args) => true,  // 是否可以并行
+})
+
+// 或更紧凑的 defineTool helper:
+const readFile = defineTool({
+  name: 'read_file',
+  parameters: ...,
+  execute: ...,
+})
+ctx.tools.register(readFile)
+Tool registry 干 3 件事
+职责	用途
+存储工具	name → ToolDefinition map
+暴露 schema	ctx.systemPrompt 通过 wireSchemas(scope) 收集所有可见 tool 的 schema
+scope 可见性	ctx.tools.view(agent) 返回 agent scope 可见的工具(同名工具在子 scope 可以 shadow)
+关键点:tool schema 进 prompt
+每个工具的 schema(OpenAI function calling 格式)被收集进 prompt assembly:
+[tool/read_file]
+- name: read_file
+- description: read a file from disk
+- parameters: { path: string }
+
+[tool/bash]
+- name: bash
+- description: run a shell command
+- parameters: { command: string, timeout?: number }
+LLM 看到这些 schema,自己决定要调哪个、参数是啥。LLM 输出:
+{ type: 'tool-call', id: 'abc', name: 'read_file', arguments: { path: '/etc/hosts' } }
+② Execution Pipeline(5 阶段)
+直观流程
+LLM 输出"我要调 read_file"之后,framework 经过 5 道关才真正执行:
+LLM 说: 调 read_file('/etc/hosts')
+         │
+         ▼
+阶段 1: prepare  (tools/pre-execute waterfall)
+         ├─ 检查参数合法性
+         ├─ 检查权限(谁允许调)
+         ├─ 检查沙箱(是否被允许访问这个路径)
+         ├─ 检查并发性(可不可并行)
+         └─ 询问用户(危险操作要确认)
+         │
+         ▼ allow → 阶段 2
+         ▼ deny → 直接返回错误结果
+         ▼ ask  → 等用户回复
+
+阶段 2: dispatch  (tools/execute waterfall)
+         └─ 实际调 tool.execute(args, exec)
+         │   ← 可以被 plugin 拦截(改写参数、mock 结果)
+
+阶段 3: finalize  (tools/post-execute waterfall)
+         ├─ 检查结果(是否成功、是否需要重新格式化)
+         ├─ 决定:accept / block / replace
+         └─ block 时,可以给模型反馈"这个工具不能用,请试别的"
+
+阶段 4: finish    (emit tools/result)
+         ├─ freeze 结果(防止后修改)
+         └─ 通知所有 listener(审计、日志)
+
+阶段 5: surface   (session.append 'tool/result')
+         └─ 落到 session log,作为下一次 LLM 调用的历史
+并行调度
+LLM 可能一次输出多个 tool calls,framework 怎么调度?
+LLM 输出:
+  [call1: read_file('a.txt'), call2: read_file('b.txt'), call3: bash('rm -rf /')]
+        │
+        ▼
+executeToolCalls(ctx, turn, step, toolCalls, signal):
+  for each tool:
+    mode = ctx.tools.executionMode(call).kind
+    // mode = 'parallel' 或 'exclusive'(可并行 / 必须独占)
+    if mode === 'parallel':
+      加入并行池(bounded: maxParallelToolCalls)
+    else:
+      等当前池跑完,独占跑这个
+
+  并行池:
+    pool.size < maxParallelToolCalls && 还有任务:
+      启动新 tool(走 5 阶段 pipeline)
+      pool.size++
+    
+    pool 不空:
+      等任何一个跑完
+      提交它的结果(按 model order 排序,保持 LLM 输出顺序)
+      pool.size--
+关键:虽然 tool 跑是并行的,但结果提交顺序跟 model 输出顺序一致(用 commitReady() model-order commit)。
+
+4. 如何持久化对话? (session persitence)
+整体架构
+进程运行时(内存):
+  Session
+    events: SessionEvent[]  ← append-only,事件溯源
+    surface: SurfaceManager ← 模型可见消息投影
+    + 各种 fold(epoch / request header / context)
+
+         ↓ 何时写?
+         │
+         ▼
+Persistence Backend(磁盘):
+  SessionLocation → SessionRawArtifact
+  { sessionId, events: SessionEvent[], header: SessionHeader }
+  
+  两种 backend:
+  - JSONL append-only 文件(简单)
+  - SQLite(SCHEMA_VERSION 单调,支持 schema 迁移)
+三个 package 的分工
+|Package|角色|
+|---|---|
+|packages/core/session/|内存中的 Session + Surface + deriveMessages|
+|packages/core/session-persistence/|Service Definition:SessionPersistence 接口|
+|packages/core/session-persistence-jsonl/|JSONL 实现|
+|packages/core/session-persistence-sqlite/|SQLite 实现|
+何时写磁盘?
+ctx.sessionPersistence.flush() 在以下时刻触发:
+|触发|原因|
+|---|---|
+|idle timeout|session 闲置 N 秒后,自动 flush(防止进程崩溃丢数据)|
+|显式 flush|用户主动 ctx.sessions.flush(sessionId)|
+|process exit|SIGTERM / SIGINT 信号处理时,flush 所有活跃 session|
+|compaction 后|compaction 改了 log,需要重新持久化|
+|turn-end|某些配置下,每个 turn 结束就 flush|
+启动时怎么恢复?
+SessionStore.restore(sessionId)(packages/core/session/src/index.ts:792-...):
+1. ctx.sessionPersistence.read(sessionId)
+   ↓
+   从 JSONL / SQLite 读出 SessionRawArtifact
+   ↓
+2. 校验:
+   - sessionFormatVersion 匹配(SCHEMA_VERSION)
+   - 所有 event 都能反序列化
+   - hash 校验(防止损坏)
+   ↓
+3. 构造 Session:
+   - new Session(header)
+   - 对每个 event 调 session.append(...)
+   - SurfaceManager 自动 rebuild(从 events 重建 visible nodes)
+   - requestHeader / requestContext 自动 fold
+   ↓
+4. session 处于完全 ACTIVE 状态,可直接 ctx.agents.resume(session)
+不变式
+SESSION_FORMAT_VERSION = 0(packages/core/session/src/types.ts:56)——磁盘格式版本号。
+- 任何写入磁盘的 event 都带版本号
+- 启动时检查版本,不兼容则拒绝加载
+- 这就是 "Backends reject old on-disk formats" 的实现
+三层保证
+┌─────────────────────────────────────────────────────────┐
+│ Layer 1: append-only log                                │
+│   events 一旦 append,不能改                               │
+│   repair.ts 处理崩溃恢复(TOOL_NOT_STARTED 等)              │
+└─────────────────────────────────────────────────────────┘
+                          ↓
+┌─────────────────────────────────────────────────────────┐
+│ Layer 2: schema version                                 │
+│   SCHEMA_VERSION 单调,disk format 升级需手动 migration    │
+│   SQLite 通过 schema_version 字段跟踪                     │
+└─────────────────────────────────────────────────────────┘
+                          ↓
+┌─────────────────────────────────────────────────────────┐
+│ Layer 3: hash / checksum                                │
+│   SessionHeader 带 hash,读时校验                          │
+│   损坏 → 抛 SessionPersistenceCorruptionError            │
+└─────────────────────────────────────────────────────────┘
+一句话
+内存 session log(append-only events)
+  ↕ flush / restore
+磁盘 artifact(events + header + version + hash)
+持久化 = 把内存数组搬到磁盘 + 启动时搬回来。
+
+5. 如何从配置组合出一个完整的Agent? (profiles + bundles + pressets)
+Profile = 顶层组合入口,Bundles = 可安装单元,Plugins = 实际挂载的代码,Presets = 单 agent 的 per-scope override。
+组合树
+Profile(用户选)
+  └── 列出要加载的 bundles
+       └── 每个 bundle 是一组 plugins + config
+            └── 实际 mount 到 root ctx 的代码
+
+cordis.yml(分层加载)
+  ├── profile 的 bundles 配置
+  ├── home 级别 patch(~/.dsh/)
+  ├── 用户级别 patch
+  └── --patch CLI overlay
+       ↓
+       ↓ 全部按顺序叠到 root ctx
+
+Preset(per-agent)
+  └── 在 agent scope 里 shadow 父级的 plugin 配置
+       (一个 profile 可以包含多个 preset,每个 agent 用一个 preset)
+三个关键概念
+1. Profile(顶层入口)
+cordis.yml 里的顶层 key,定义"我要哪些 bundle":
+# ~/.dsh/profiles/web.yml
+dsh.profile:
+  bundles:
+    - '@deepseek-ai/dsh-base'           # 必需
+    - '@deepseek-ai/dsh-web-app'        # web UI 加这个
+dsh 命令的入口(--profile web)读这个文件,按顺序加载 bundles。
+2. Bundle(可分发单元)
+每个 bundle 在自己的 package.json 声明 dsh.bundle:
+// packages/bundle/web-app/package.json
+{
+  "name": "@deepseek-ai/dsh-web-app",
+  "dsh": {
+    "bundle": "./bundle.cordis.yml"
+  }
+}
+bundle.cordis.yml 里是 plugins 列表:
+# packages/bundle/web-app/bundle.cordis.yml
+plugins:
+  - name: webserver
+    apply: '@deepseek-ai/dsh-host-webserver'
+  - name: frontend
+    apply: '@deepseek-ai/dsh-host-frontend-static'
+  - name: hmr
+    apply: '@deepseek-ai/dsh-client-hmr'
+Bundle 是 npm 包,可以直接 publish、install——这就是为什么 DeepSeek Harness 可以装第三方 bundle。
+3. Preset(per-agent composition)
+预设 = 单 agent 的完整配方(LLM config + persona + tools + sections):
+ctx.agents.create({
+  preset: 'code-review-agent',
+  // 或内联:
+  // preset: { name: 'foo', sections: [...], tools: [...], llm: {...} }
+})
+preset 在自己的 agent scope 里 mount plugins / 写 sections,shadow 父级(profile-level)的同名配置。
+加载顺序(Patch Layering)
+底层  Profile 列出 bundles → bundle 的 plugins → 挂载
+                                ↓
+                              用户 home (~/.dsh/patches/*.yml) → patch
+                                ↓
+                              用户 cwd (./.dsh/patches/*.yml) → patch
+                                ↓
+顶层  --patch CLI 参数 → 临时 patch
+Patch 替换 row by id,或插入新 row。这让用户可以不改 bundle 源码就 override 任何插件。
+真实例子:web profile
+# ~/.dsh/profiles/web.yml
+dsh.profile:
+  bundles:
+    - '@deepseek-ai/dsh-base'
+    - '@deepseek-ai/dsh-web-app'
+    - '@deepseek-ai/dsh-acp'  # 想加 ACP 服务也加一行
+启动 dsh --profile web,Cordis:
+1. 加载 base bundle(model / tools / session / sandbox / approval / settings / credentials / telemetry)
+2. 加载 web-app bundle(webserver / frontend / hmr)
+3. 加载 acp bundle(acp 服务)
+4. 应用 home / cwd / --patch 的所有 patch
+5. 全部 mount 到 root ctx
+一句话
+Profile 选 bundles → bundles 挂载 plugins → patches 覆盖 row
+                                              ↓
+                                              + Presets(per-agent override)
+                                              ↓
+                                              一个完整的 Agent
+
+6. 如何让人类审批Agent的危险操作? (approval + permission)
+Tool 跑之前,framework 会先问"这个操作人类批不批?"——批了才跑,不批就停。这个"先问再跑"由 approval service 管。
+4 个参与者
+1. Tool(framework 的执行管道)
+   ↓ 说"这个操作有点危险,我不敢自己跑,问 user 吧"
+   
+2. Approval Service(framework 的中间人)
+   ↓ 把"问 user"这件事广播出去,等 user 决定
+   
+3. UI Provider(实际问 user 的界面)
+   - Web:弹 dialog
+   - CLI:在终端问
+   - ACP:发给客户端
+   - headless:没 user,默认拒绝
+   
+4. User
+   ↓ 选 allow / deny / modify
+决策怎么流转
+Tool 想跑
+  ↓
+Tool 的 pre-execute 阶段返回"ask"
+  ↓
+Approval service 收到
+  ↓ 先查 policy:有没有预设规则已经决定?
+  ├─ policy 决定 allow → 直接放行,不打扰 user
+  ├─ policy 决定 deny  → 直接拒绝,不打扰 user
+  └─ policy 没决定    → 真的问 user
+      ↓
+      UI provider 弹 dialog / 问 stdin / 发客户端
+      ↓
+      user 决定
+      ↓
+      落库 session event(approval/asked + approval/decided)
+      ↓
+      Tool 拿到结果,继续或终止
+三层 policy 覆盖
+底层  预设默认值     ─ "这个 agent 通常允许 tool/A,问 tool/B"
+中层  session 覆盖  ─ "这次会话里 tool/C 永远 ask"
+顶层  runtime 决定  ─ "user 这次说 deny"
+                  (优先级最高,但只是这一次)
 
 # 第四部分 — Q & A
 
 > 本部分收集对 Cordis 与 DeepSeek Harness 的核心问题。问题按"直击本质"程度排序。
 
-## 一、关于项目本质的 7 个核心问题
-
-掌握第一部分(10 概念)+ 第二部分(7 命题)之后,以下问题能直击项目本质——它们把"原语"组装成"运行时序"。
-
-### Q1:一次 agent 操作的完整旅程
-
-**问题**:用户敲一句话,从键盘到屏幕上看到回复,这中间发生了什么?经过哪些模块、产生哪些事件、写到哪里?
-
-**直击的本质**:**控制流 + 数据流**——framework 怎么把"输入"变成"输出"。
-
-**问题**:用户敲一句话,从键盘到屏幕上看到回复,这中间发生了什么?
-
-#### 1. 概念层 — 11 个阶段用到哪些 Cordis 原语
-
-| 阶段 | 用到的概念 | 关键代码 |
-|---|---|---|
-| 1. 用户输入 → Inbox | Service / Fiber / Mixin | `agent-loop/src/agent.ts:113-120` |
-| 2. 唤醒 driver | Event(emit)/ Effect | `agent-loop/src/agent.ts:172-193` |
-| 3. turn 主循环 | Event + 原型链 scope | `agent-loop/src/agent.ts:246-330` |
-| 4. pre-step | 5 模态(waterfall) | `agent-loop/src/agent.ts:225-243` |
-| 5. step LLM call | Mixin(stream)/ waterfall | `agent-loop/src/agent.ts:332-401` |
-| 6. tool execution | 5 模态(pre-execute/execute/post-execute) | `tool-calls.ts:59-101` + `tools/src/index.ts:1459-1646` |
-| 7. 多 step 循环 | state machine | `agent-loop/src/agent.ts:283-296` |
-| 8. turn 收尾 | serial event | `agent-loop/src/agent.ts:296` |
-| 9. session 广播 | session/event emit | `session/src/index.ts:604-655` |
-| 10. 跨 turn 衔接 | phase 转换 / fiber 状态机 | `agent-loop/src/agent.ts:315-329` |
-
-#### 2. 时序图
-
-```
-用户线程                          driver-fiber
-========                          ============
-ctx.agents.followup(msg)  ──→  ReactLoopAgent.send(msg, 'next-turn', true)
-                                  ├─ inbox.splice(...)
-                                  │  └─ session.append('agent/inbox/spliced', ...) ─┐
-                                  ├─ dispatch.emit('agent/inbox/inserted', {...})  │
-                                  └─ wakeDriver()                                    │
-                                     ├─ setPhase({kind:'running', ...})              │
-                                     │  └─ dispatch.emit('agent/status', running)   │
-                                     └─ withInitiator(this, () => this.kick())     │
-                                                                                    ▼
-                                                                        ┌──────────────────┐
-                                                                        │  kick() 循环     │
-                                                                        │  turn() 循环     │
-                                                                        └──────────────────┘
-
-阶段 3-5:turn N 开始
-  session.append('turn/start', { turn: N })            → 落库
-  preStep(target='next-turn', {N, 1}):
-    ├─ inbox.claim(target, N)                              → 'agent/inbox/claimed'
-    ├─ systemPrompt.assemble(assembleContextFor(this))     → 'system-prompt/assemble'
-    ├─ renderContextSections → joinContextSections
-    ├─ runtimeContext.project(joinContextSections, sections) [no-op 检测]
-    └─ dispatch.waterfall('agent/pre-step', {messages, turn, step, signal})
-       → 可能 reject(空消息)或 enter(messages + 可能的 context)
-
-阶段 5:step 1
-  session.append('step/start', { turn: N, step: 1 })    → 落库
-  for each message in decision.messages:
-    session.append('user/message', message, { surfaceOp: 'append' })  → 落库 + surface
-
-  step(assembly):
-    buildRequest(turn, step, tools, system, deriveMessages(), signal):
-      ├─ seedConfig from requestHeader() (增量 fold)
-      ├─ dispatch.waterfall('agent/request', {turn, step, signal})
-      ├─ llm.prepareCall(config, signal)
-      ├─ session.append('request/header', {header, reason})  → 落库
-      ├─ session.append('request/context', ...) (仅变化时)
-      └─ 构造 freeze request {messages, system, tools, sessionId, signal}
-    llm.stream(request) [or preparedCall.stream]:
-      for each chunk:
-        session.append('assistant/chunk', {turn, step, chunk})  → 落库
-        BlockAssembler.push(chunk)
-      finish = assembler.finish
-      if error/aborted → dispatch.waterfall('agent/request-error', ...)
-                          if retry → continue (重试)
-    session.append('assistant/message',
-      {turn, step, message, usage?},
-      {surfaceOp: 'append', sourceEventSeqs: chunkSeqs})  → 落库 + surface
-    if max-tokens → return {kind:'max-tokens'}
-    if no tool-call → return {kind:'completed'}
-    executeToolCalls(loopCtx, turn, step, toolCalls, signal):
-      while next < planned.length:
-        mode = ctx.tools.executionMode(first).kind
-        group = mode === 'parallel' ? planned.slice(next) : [first]
-        runGroup(ctx, turn, step, group, mode, signal):
-          # 5 阶段 pipeline(每个 tool 一遍)
-          for each call in group:
-            session.append('tool/call', {turn, step, callId, name, args})  → 落库 (log-only)
-            prepared = TOOL_RUNTIME_SCHEDULER.prepare(exec):
-              ├─ ctx.waterfall('tools/pre-execute', exec)  → allow/deny/ask
-              ├─ serviceAsk (if ask)
-              ├─ guardReason (monotonic)
-              └─ return {kind: 'dispatch', exec}
-            if dispatch:
-              ctx.waterfall('tools/execute', exec)
-                └─ tool.execute(args, exec)  [call actual tool body]
-            # 后台并行,model-order commit
-            if result ready:
-              TOOL_RUNTIME_SCHEDULER.finalize:
-                ├─ ctx.waterfall('tools/post-execute', exec, result)  → accept/block/replace
-                ├─ materializeFinalResult (snapshot + freeze)
-                └─ applyFinalContent (tool-owned transform)
-              TOOL_RUNTIME_SCHEDULER.finish:
-                └─ ctx.emit('tools/result', exec, result)
-              session.append('tool/result',
-                {turn, step, message, error?, meta?},
-                {surfaceOp: 'append', sourceEventSeqs: [callSeq]})  → 落库 + surface
-
-阶段 7-8:多 step 与 turn 收尾
-  session.append('step/end', { turn: N, step: 1 })       → 落库
-  if turnEnds && inbox.nextStep.length === 0:
-    dispatch.serial('agent/turn-stopping', {turn, signal})  → 可被拦截修改 turnEnds
-  if turnEnds: break
-  target = 'next-step'  # 继续下一个 step
-
-  session.append('turn/end', { turn: N, reason: turnEnds })  → 落库
-  if inbox.hasPending:
-    phase reset, kick next turn  # 自动开下一个 turn
-  else:
-    setPhase({kind: 'idle'})
-      └─ dispatch.emit('agent/status', idle)
-
-阶段 10:session/event 广播(每个 session.append 后)
-  ctx.events.emit('session/event', event)  # 含 contained dispatch
-```
-
-#### 3. 数据流 — Session event 全序列
-
-每个 turn 内产出的 session event(`session/types.ts:236-333`):
-
-| 序号 | Event 类型 | surfaceOp | 关键字段 |
-|---|---|---|---|
-| 1 | `agent/inbox/spliced` | (log) | target, start, inserted[] |
-| 2 | `turn/start` | (log) | turn |
-| 3 | `agent/inbox/claimed` | (log) | message, turn |
-| 4 | `step/start` | (log) | turn, step |
-| 5 | `user/message` | append | message(user 直接落库为 surface) |
-| 6 | `request/header` | (log) | header, reason |
-| 7 | `request/context` | (log) | provider, model, contextWindow? |
-| 8 | `assistant/chunk`*N | (log) | chunk |
-| 9 | `assistant/message` | append + sourceEventSeqs | message, usage? |
-| 10 | `tool/call` *N | (log) | callId, name, arguments |
-| 11 | `tool/result` *N | append + sourceEventSeqs | message, error?, meta? |
-| 12 | `step/end` | (log) | turn, step |
-| 13 | `agent/turn-stopping` | (Cordis serial, **非 session event**) | turn, signal |
-| 14 | `turn/end` | (log) | turn, reason |
-
-**`sourceEventSeqs` 字段**是 surface event 指向它由哪些 log event 派生——这是后续 replay / projection / undo 的关键。
-
-#### 4. 关键概念到代码的映射
-
-| 概念 | 实际应用 |
-|---|---|
-| **Effect/Disposable** | `agent-loop/src/index.ts:349` `ctx.effect(() => this.ownership.dispose(), 'agentLoop.transactions()')`——AgentLoop 卸载时,所有它创建的 agent 一并 dispose |
-| **Scope + Filter** | `dispatch.ts:107-149` `agentEvents(ctx, this)`——所有 `agent/*` 事件自动带 scope filter,祖先 listener admit,后代不通过 |
-| **5 模态分发** | `emit` 用于 status / inbox-inserted(`agent.ts:87-91`);`serial` 用于 turn-stopping(`agent.ts:296`);`waterfall` 用于 pre-step / request / tool pipeline |
-| **Mixin** | `ctx.llm`/`ctx.tools`/`ctx.systemPrompt` 都是 service 提供的 mixin,loop 直接 `loopCtx.llm.stream(request)` 调用 |
-| **Inject** | `static inject = ['agents', 'sessions', 'llm', 'tools', 'systemPrompt']`(`agent-loop/index.ts:297`)——所有依赖通过声明拿到 |
-| **Epoch 反应性** | `request/header` 和 `request/context` 的"仅变化时"写入(增量 fold)——避免重复 |
-| **State machine** | phase 转换 + `setPhase` 唯一性保证(`agent.ts:104-111`)—— `agent/status` 事件是 reduced diff |
-
-### Q2:LLM 看到的"模型历史"从哪来
-
-**问题**:模型不是只看到当前对话,它看到的是拼出来的 prompt。这个 prompt 从哪里拼?哪些是 system prompt、哪些是历史消息、哪些是 tool 描述、哪些是注入的 context?
-
-**直击的本质**:**"模型可见 = 日志可重建"**——Cordis 的核心承诺在这里具象化。SessionEvent log 是唯一真相源,prompt 是 log 的视图。
-
-#### 1. 概念层 — prompt 组成的四个来源
-
-```
-LLM 看到的内容
-  ├─── system 字段(拼出来的字符串)
-  │     ├─ sections(按 order 排序的文本段)
-  │     ├─ contexts(运行时快照,如 cwd / 进程信息)
-  │     ├─ variables(用于 {{name}} 替换的字典)
-  │     └─ tools(模型可见的工具 schema 列表)
-  └─── messages 数组(从 session log 派生)
-        ├─ user/message (直接 surface)
-        ├─ assistant/message (content blocks)
-        └─ tool/result (跟 tool/call 配对)
-```
-
-**4 个 Cordis 概念**:Service(SystemPrompt 拼装)/ Scope(ScopedLayers)/ Provider(tool schema 收集)/ Surface(消息派生)。
-
-#### 2. 数据流 — Prompt 组装流水线
-
-`systemPrompt.assemble(ctx)`(`core/system-prompt/src/index.ts:467-542`):
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│ 1. 收集 scope 层                                                        │
-│    const scopeLayers = this.layers.chainLayers(scope)              │
-│    (global + agent-scope,后者 shadow 前者)                                │
-└─────────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│ 2. 合并 variables(scope shadow 全局)                                       │
-│    const variables = [...]                                           │
-│    - agent-loop 注册: provider, model, cwd                            │
-│    - 部署配置: deployment-id, runtime-config 等                          │
-└─────────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│ 3. 合并 sections(同名 shadow)                                             │
-│    sectionByName = merge(scope, layer => layer.sections)              │
-│    - harness:identity (order=-100,固定首位)                              │
-│    - deployment:persona (order=0,可被 preset shadow)                  │
-│    - tool:<name> 引导 (order=116.5,plugin 自动注册)                     │
-└─────────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│ 4. 收集 tool schemas                                                    │
-│    for each provider in [...global, ...scopeLayers]:                  │
-│      collected.push(...provider(context).schemas)                       │
-│    orderTools(collected, this.toolOrder, knownNames)                   │
-└─────────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│ 5. waterfall(允许 plugin 改)                                                │
-│    const transformed = await ctx.waterfall(                            │
-│      scopeTarget(this, scope),                                        │
-│      'system-prompt/assemble',                                       │
-│      assembly,                                                        │
-│      () => Promise.resolve(assembly)                                  │
-│    )                                                                  │
-└─────────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│ 6. 渲染 system 文本                                                       │
-│    const system = renderPrompt(assembly)                              │
-│      - sections 按 order join                                          │
-│      - variables 用 {{name}} 严格替换                                   │
-│      - 空 section 跳过                                                  │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-#### 3. 数据流 — Session → Messages 派生
-
-**关键抽象**:`Session.surface`(`session/src/index.ts:430-433`)
-
-`Session` 不直接持有"模型可见消息"——它持有 `SurfaceManager`,后者维护 `nodes: number[]`,代表"模型可见"的 event seq 列表。
-
-```ts
-// session/src/index.ts:726-747
-deriveMessages(): Message[] {
-  if (generation !== this.derivedGeneration) {
-    this.derived = []; this.derivedNodes = 0;
-    this.derivedGeneration = generation   // 替换重置
-  }
-  for (const seq of surface.nodes.slice(this.derivedNodes)) {
-    const msg = this.deriveEventMessage(this.log[seq]!)
-    if (msg) this.derived.push(msg)
-  }
-  this.derivedNodes = surface.nodes.length
-  return [...this.derived]
-}
-```
-
-`deriveEventMessage`(`surface.ts:83-114`)逐节点映射:
-
-| Event 类型 | 派生为 Message? | 怎么映射 |
-|---|---|---|
-| `user/message` | ✅ | `event.data` 直接(message 已经是 UserMessage) |
-| `assistant/message` | ✅(除非空 content) | `event.data.message`(content blocks) |
-| `tool/result` | ✅ | `event.data.message` |
-| 其他(turn/step 边界、chunk、log-only) | ❌ | 返回 null,不进 messages |
-
-**为什么 surface 是单独的节点列表而不是直接遍历 log?**
-
-因为模型可见 ≠ 全部事件:
-- chunks 单独存(为了 replay),但只有合成的 `assistant/message` 进 messages
-- turn/step 边界不暴露给模型
-- 某些 log-only event 也不进
-
-#### 4. 不变式:"模型可见 = 日志可重建"
-
-**这是 Cordis 在 agent-loop 层的运行时校验**(`agent-loop/src/invariant.ts:21-54`):
-
-```ts
-ctx.on('llm/stream', (options: GenerateOptions, next) => {
-  if (!isAgentLoopRequest(options)) return next()
-  // 1. options frozen
-  // 2. options.sessionId live
-  // 3. messages frozen
-  // 4. at least one step/start event
-  // 5. request/header event exists
-  // 6. derived messages == options.messages  ← 关键
-  // 7. header matches
-  return next()
-}, { global: true, prepend: true })
-```
-
-**第 6 条**:LLM 收到的 `messages` 必须等于 `session.deriveMessages()`——即"模型看到的"必须等于"日志重建出来的"。
-
-**这个不变式保护什么?**
-
-- 不能"传一个伪造的 messages 给 LLM"——必须经过 session 投影
-- session 的修改必须让 messages 一致变化——projection 必须能覆盖
-- replay / resume / fork 时,模型历史必须从 log 重建,不能凭空构造
-
-**违反的后果**:`invariant` 失败 → 抛错,agent 启动失败。
-
-#### 5. 关键概念到代码的映射
-
-| 概念 | 实际应用 |
-|---|---|
-| **Scope** | `ScopedLayers` (`core/scope/src/store.ts`):同名 section 在 agent scope shadow 全局 |
-| **Mixin** | `ctx.systemPrompt`、`ctx.llm` 都是 service 的 mixin,直接 `ctx.systemPrompt.assemble()` |
-| **Event 5 模态** | `system-prompt/assemble` 用 `waterfall`(允许 plugin 改 assembly);`agent/pre-step` 用 `waterfall` |
-| **Inject** | `systemPrompt.inject = ['agents', 'sessions', 'tools']` 等 |
-| **Effect/Disposable** | 每次 `ctx.systemPrompt.section({...})` 注册 section = effect,plugin unload 自动撤销 |
-| **Surface** | 整个 SurfaceManager 设计是 Cordis effect 协议的极致应用——append-only + 派生视图 |
-
-### Q3:Tool call 的完整生命周期
-
-**问题**:LLM 输出"我要调 bash",从它输出到 bash 真执行,中间过了几道关?权限?沙箱?超时?返回值怎么回到 session log?
-
-**直击的本质**:**Capability seam 的实际工作流**——5 种 dispatch 模态的现场使用,以及"agent 不能为所欲为"的安全边界。
-
-**会引导到**:plugin/tool 的实际架构、`tools/pre-execute | execute | post-execute` 瀑布链。
-
-### Q4:一次失败怎么"善后"
-
-**问题**:tool 崩了、LLM 超时、用户中途取消、agent 自己抛错——这些情况 framework 怎么恢复?session log 怎么补偿?怎么避免污染?
-
-**直击的本质**:**append-only log 的代价与对策**——事件溯源里"撤销不存在,只能补偿"。
-
-**会引导到**:Cordis 的 epoch 反应性、Session repair、turn-end reason 的多样性。
-
-### Q5:多 agent 怎么组合
-
-**问题**:subagent、workflow、skill 三种"多 agent"形态,在 Cordis 上分别怎么实现?recursion 怎么处理?子 agent 怎么报告给父?
-
-**直击的本质**:**Agent 复用的三种模式**——fork(继承上下文)、spawn(独立)、workflow(脚本驱动)。
-
-**会引导到**:Cordis 怎么用 fiber 树表达"agent 关系"、scope 在多 agent 中的作用。
-
-### Q6:agent 怎么"修改自己"
-
-**问题**:一个 agent 在运行时能加载新 plugin、改变自己行为吗?这跟 HMR 有什么区别?会不会失控?
-
-**直击的本质**:**自修改边界**——agent 是"用户"还是"代码"。
-
-**会引导到**:self-modification 包的存在意义、Cordis fiber 在自修改场景下的安全性。
-
-### Q7:session 怎么"记住"和"被检索"
-
-**问题**:session log 是 append-only 几百万行,模型不可能全看。怎么投影、怎么索引、怎么"挑出相关"?
-
-**直击的本质**:**日志 → 模型可见的过滤机制**。
-
-**会引导到**:projection、query、skill 系统的设计。
