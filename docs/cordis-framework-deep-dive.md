@@ -1091,7 +1091,7 @@ function handleError(info, reason, getOuterStack): never {
 # 第三部分 — Deepseek Harness 在 Cordis 基础上怎么构建的 Agent
 ## 核心问题
 Cordis解决的是“如何把插件拼在一起”，DSH需要回答：
-1. 如何驱动一个Agent的对话循环?(Agent Loop)
+### 1. 如何驱动一个Agent的对话循环?(Agent Loop)
 用户输入 → Inbox 排队 → driver 唤醒 → turn 循环(每个 step:抢消息 / 拼 prompt / 调 LLM / 跑 tool)→ 结果落 session log → 回屏幕。
 6 个核心节点
 用户键入 ──① Inbox──② wakeDriver──③ turn 循环──④ step(LLM call)──⑤ tool 执行──⑥ 屏幕
@@ -1111,7 +1111,7 @@ Cordis解决的是“如何把插件拼在一起”，DSH需要回答：
 |⑤ tool 执行|packages/core/tools/	5 阶段 pipeline|(pre-execute/execute/post-execute/result)|
 |⑥ 屏幕输出|Web UI / ACP / CLI|UI 层(不是 agent-loop 本身)|
 
-2. 如何让模型看到正确的上下文?(Session log + system prompt)
+### 2. 如何让模型看到正确的上下文?(Session log + system prompt)
 *prompt 是"拼出来的字符串",messages 是"从 session log 投影出来的"*——两件事各管一段。
 4 个 prompt 来源
 LLM 看到的内容
@@ -1132,7 +1132,7 @@ LLM 看到的内容
 |system-prompt/assemble waterfall|允许 plugin 改 assembly——决定 prompt 最终形态|
 |request/header 增量 fold|每次 buildRequest 比对前一次,只在变化时写 log|
 
-3. 如何让Agent调用工具?(tool registry + executrion pipeline)
+### 3. 如何让Agent调用工具?(tool registry + executrion pipeline)
 两件事
 如何让Agent调用工具 = 
   ① Tool Registry(怎么注册 + 怎么让 LLM 看到工具)
@@ -1233,7 +1233,7 @@ executeToolCalls(ctx, turn, step, toolCalls, signal):
       pool.size--
 关键:虽然 tool 跑是并行的,但结果提交顺序跟 model 输出顺序一致(用 commitReady() model-order commit)。
 
-4. 如何持久化对话? (session persitence)
+### 4. 如何持久化对话? (session persitence)
 整体架构
 进程运行时(内存):
   Session
@@ -1314,7 +1314,7 @@ SESSION_FORMAT_VERSION = 0(packages/core/session/src/types.ts:56)——磁盘格
 磁盘 artifact(events + header + version + hash)
 持久化 = 把内存数组搬到磁盘 + 启动时搬回来。
 
-5. 如何从配置组合出一个完整的Agent? (profiles + bundles + pressets)
+### 5. 如何从配置组合出一个完整的Agent? (profiles + bundles + pressets)
 Profile = 顶层组合入口,Bundles = 可安装单元,Plugins = 实际挂载的代码,Presets = 单 agent 的 per-scope override。
 组合树
 Profile(用户选)
@@ -1398,7 +1398,7 @@ Profile 选 bundles → bundles 挂载 plugins → patches 覆盖 row
                                               ↓
                                               一个完整的 Agent
 
-6. 如何让人类审批Agent的危险操作? (approval + permission)
+### 6. 如何让人类审批Agent的危险操作? (approval + permission)
 Tool 跑之前,framework 会先问"这个操作人类批不批?"——批了才跑,不批就停。这个"先问再跑"由 approval service 管。
 4 个参与者
 1. Tool(framework 的执行管道)
@@ -1440,6 +1440,20 @@ Approval service 收到
                   (优先级最高,但只是这一次)
 
 # 第四部分 — Q & A
+1. 服务与服务之间的流程关系如何通过热插拔实现？比如A->B->C, 如果要加载D到B和C之间, 服务之间的接口怎么对齐？如果要把B删除，A怎么知道要接入到C呢?
+Cordis里的服务没有硬编码，流程是通过**事件**表达的
 
-> 本部分收集对 Cordis 与 DeepSeek Harness 的核心问题。问题按"直击本质"程度排序。
+并非A直接调用B，B直接调用C，而是agent loop发出 ‘agent/pre-step’ 事件，所有监听这个事件的插件按顺序处理
+- 加D到B和C之间，D只需要注册一个事件监听器，waterfall链会自动把它插进去
+- 删除B，B的监听器随fiber卸载自动移除，waterfall链自动跳过B，A->C自然连通
 
+顺序问题解决了，紧接着就会有一个新的问题，就是接口对齐的问题，不同服务之间的入参和出参不一样，怎么做到热插拔？
+
+Cordis 方式：接口是事件类型定义，不是点对点方法签名。
+```
+interface Events {
+  // 事件名、参数类型、返回类型、分发模式 = 接口契约
+  ‘agent/request’(inputs:Request, next: () => Response): Response
+}
+```
+相当于所有基于Cordis的服务都要遵照这个'契约'来约束服务的输入和输出。
